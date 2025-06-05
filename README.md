@@ -51,6 +51,7 @@ This repo, named **SkyReels-A1**, contains the official PyTorch implementation o
 
 
 ## 🔥🔥🔥 News!!
+* Jun 1, 2025: 🎉 We published the technical report, [SkyReels-Audio: Omni Audio-Conditioned Talking Portraits in Video Diffusion Transformers.](https://arxiv.org/pdf/2506.00830)
 * Apr 3, 2025: 🔥 We release [SkyReels-A2](https://github.com/SkyworkAI/SkyReels-A2). This is an open-sourced controllable video generation framework capable of assembling arbitrary visual elements.
 * Mar 4, 2025: 🔥 We release audio-driven portrait image animation pipeline. Try out on [Huggingface Spaces Demo](https://huggingface.co/spaces/Skywork/skyreels-a1-talking-head) !
 * Feb 18, 2025: 👋 We release the inference code and model weights of SkyReels-A1. [Download](https://huggingface.co/Skywork/SkyReels-A1)

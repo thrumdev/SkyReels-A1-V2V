@@ -91,6 +91,35 @@ class CogVideoXPatchEmbed(nn.Module):
             pos_embedding = self._get_positional_embeddings(sample_height, sample_width, sample_frames)
             self.register_buffer("pos_embedding", pos_embedding, persistent=persistent)
 
+    def expand_proj_channels(self, new_in_channels: int):
+        """
+        Expands self.proj to have `new_in_channels` input channels. No-op if already equal.
+        New channels are zeroed. Previous weights are preserved.
+        """
+        old_conv = self.proj
+        old_in_channels = old_conv.in_channels
+        if new_in_channels <= old_in_channels:
+            return  # No expansion needed
+        
+        print("Expanding token embedding channels to 16")
+        new_conv = nn.Conv2d(
+            new_in_channels,
+            old_conv.out_channels,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+            dilation=old_conv.dilation,
+            groups=old_conv.groups,
+            bias=(old_conv.bias is not None),
+            padding_mode=old_conv.padding_mode,
+        )
+        with torch.no_grad():
+            new_conv.weight.zero_()
+            new_conv.weight[:, :old_in_channels, :, :] = old_conv.weight
+            if old_conv.bias is not None:
+                new_conv.bias.copy_(old_conv.bias)
+        self.proj = new_conv
+
     def _get_positional_embeddings(self, sample_height: int, sample_width: int, sample_frames: int) -> torch.Tensor:
         post_patch_height = sample_height // self.patch_size
         post_patch_width = sample_width // self.patch_size

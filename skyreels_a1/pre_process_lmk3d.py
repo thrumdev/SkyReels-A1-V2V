@@ -34,6 +34,18 @@ class FaceAnimationProcessor:
         self.smirk_encoder.load_state_dict(checkpoint_encoder)
         self.smirk_encoder.eval()
 
+    def face_mask(self, image):
+        """
+        Yields a binary mask of the same H, W as `image`, using insightface.app.FaceAnalysis
+        to select only the pixels included in the landmarks.
+        """
+        faces = self.app.get(image)
+        kps = faces[0]['kps']
+        mask = np.zeros(image.shape[:2], dtype=np.uint8)
+        pts = np.array(kps, dtype=np.int32)
+        cv2.fillConvexPoly(mask, pts, 1)
+        return mask
+
     def face_crop(self, image):
         height, width, _ = image.shape
         faces = self.app.get(image)
@@ -221,6 +233,46 @@ class FaceAnimationProcessor:
                 landmarks_fan=flame_output['landmarks_fan'], source_tform=source_tform,
                 tform_512=None, weights_468=weights_468[i], weights_473=weights_473[i],
                 landmarks_mp=flame_output['landmarks_mp'], shape=image_original.shape)
+            rendered_img = renderer_output['rendered_img']
+            driving_outputs_list.extend(np.copy(rendered_img)[np.newaxis, :])
+        return driving_outputs_list
+    
+        
+    def preprocess_lmk3d_multi(self, source_image_list, driving_image_list):
+        source_outputs = []
+        source_tform = []
+        image_original = []
+
+        for source_image in source_image_list:
+            outputs, tform, original = self.process_source_image(source_image)
+            source_outputs.append(outputs)
+            source_tform.append(tform)
+            image_original.append(original)
+
+        _, driving_outputs, driving_video_tform, weights_473, weights_468 = self.process_driving_img_list(driving_image_list)
+        driving_outputs_list = []
+        source_pose_init = source_outputs[0]['pose_params'].clone()
+        driving_outputs_pose = [outputs['pose_params'] for outputs in driving_outputs]
+        driving_outputs_pose = self.smooth_params(driving_outputs_pose)
+        for i, outputs in enumerate(driving_outputs):
+            outputs['pose_params'] = driving_outputs_pose[i]
+            source_outputs[i]['expression_params'] = outputs['expression_params']
+            source_outputs[i]['jaw_params'] = outputs['jaw_params']
+            source_outputs[i]['eye_pose_params'] = outputs['eye_pose_params']
+            source_matrix = self.rodrigues_to_matrix(source_pose_init)
+            driving_matrix_0 = self.rodrigues_to_matrix(driving_outputs[0]['pose_params'])
+            driving_matrix_i = self.rodrigues_to_matrix(driving_outputs[i]['pose_params'])
+            relative_rotation = torch.inverse(driving_matrix_0) @ driving_matrix_i
+            new_rotation = source_matrix @ relative_rotation
+            source_outputs[i]['pose_params'] = self.matrix_to_rodrigues(new_rotation)
+            source_outputs[i]['eyelid_params'] = outputs['eyelid_params']
+            flame_output = self.flame.forward(source_outputs[i])
+            renderer_output = self.renderer.forward(
+                flame_output['vertices'],
+                source_outputs[i]['cam'],
+                landmarks_fan=flame_output['landmarks_fan'], source_tform=source_tform[i],
+                tform_512=None, weights_468=weights_468[i], weights_473=weights_473[i],
+                landmarks_mp=flame_output['landmarks_mp'], shape=image_original[i].shape)
             rendered_img = renderer_output['rendered_img']
             driving_outputs_list.extend(np.copy(rendered_img)[np.newaxis, :])
         return driving_outputs_list

@@ -260,7 +260,6 @@ class Preprocessor:
         """
 
         video_id = os.path.splitext(video_path.split("/")[-1])[0]
-        output_filename = f"{video_id}.pt"
 
         video = VideoReader(video_path, num_threads=1)
         frames = video.get_batch(range(len(video))).asnumpy()  # Load all frames as numpy array

@@ -258,9 +258,8 @@ class Preprocessor:
             video_path (str): Path to the video file to preprocess.
         """
 
-        video_filename = os.path.splitext(video_path.split("/")[-1])[0]
-        output_filename = f"{video_filename}.pt"
-        output_file = os.path.join(self.output_dir, output_filename)
+        video_id = os.path.splitext(video_path.split("/")[-1])[0]
+        output_filename = f"{video_id}.pt"
 
         video = VideoReader(video_path, num_threads=1)
         frames = video.get_batch(range(len(video))).asnumpy()  # Load all frames as numpy array
@@ -272,46 +271,49 @@ class Preprocessor:
         driving_video, landmarks = self.facial_landmarks(frames_tensor)
         pixel_mask = self.pixel_mask(frames_tensor, landmarks)
         optical_flow_mask = self.optical_flow_mask(frames_tensor)
+        identity_image = self.cropped_aligned_identity(frames_tensor)
 
-        with open(output_file, "wb") as f:
-            torch.save({
-                "ref_video": frames_tensor,
-                "driving_video": driving_video,
-                "mask": pixel_mask,
-                "optical_flow_mask": optical_flow_mask,
-                "cropped_aligned_identity": self.cropped_aligned_identity(frames_tensor),
-            }, f)
+        # Save original video. Permute to (T, H, W, C) for video saving
+        original_video_np = (frames_tensor.permute(1, 2, 3, 0).cpu().numpy() * 255).astype(np.uint8) # (T, H, W, C)
+        out_path = os.path.join(self.output_dir, f"{video_id}_original.avi")
+        fourcc = cv2.VideoWriter_fourcc(*'FFV1')
+        out = cv2.VideoWriter(out_path, fourcc, 16, (width, height))
+        for frame in original_video_np:
+            out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        out.release()
 
-        # Save processed videos if requested
-        if getattr(self.args, 'save_videos', False):
-            # Save driving video. Permute to (T, H, W, C) for video saving
-            driving_video_np = (driving_video.permute(1, 2, 3, 0).cpu().numpy() * 255).astype(np.uint8) # (T, H, W, C)
-            out_path = os.path.join(self.output_dir, f"{video_filename}_driving.mp4")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(out_path, fourcc, 16, (width, height))
-            for frame in driving_video_np:
-                out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-            out.release()
+        # Save driving video. Permute to (T, H, W, C) for video saving
+        driving_video_np = (driving_video.permute(1, 2, 3, 0).cpu().numpy() * 255).astype(np.uint8) # (T, H, W, C)
+        out_path = os.path.join(self.output_dir, f"{video_id}_driving.avi")
+        out = cv2.VideoWriter(out_path, fourcc, 16, (width, height))
+        for frame in driving_video_np:
+            out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        out.release()
 
-            # Save pixel mask video. Squeeze to (T, H, W) first
-            mask_np = (pixel_mask.squeeze(0).cpu().numpy() * 255).astype(np.uint8) # (T, H, W)
-            out_path = os.path.join(self.output_dir, f"{video_filename}_mask.mp4")
-            out = cv2.VideoWriter(out_path, fourcc, 16, (width, height))
-            for frame in mask_np:
-                out.write(cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR))
-            out.release()
+        # Save pixel mask video. Squeeze to (T, H, W) first
+        mask_np = (pixel_mask.squeeze(0).cpu().numpy() * 255).astype(np.uint8) # (T, H, W)
+        out_path = os.path.join(self.output_dir, f"{video_id}_mask.avi")
+        out = cv2.VideoWriter(out_path, fourcc, 16, (width, height))
+        for frame in mask_np:
+            out.write(cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR))
+        out.release()
 
-            # Save optical flow mask video. Squeeze to (T, H, W) first
-            optical_flow_mask = optical_flow_mask / 1.5 # normalize to [0, 1.0]
-            flow_np = (optical_flow_mask.squeeze(0).cpu().numpy() * 255).astype(np.uint8) # (T-1, H, W)
-            out_path = os.path.join(self.output_dir, f"{video_filename}_flow_mask.mp4")
-            out = cv2.VideoWriter(out_path, fourcc, 16, (width, height))
-            for frame in flow_np:
-                out.write(cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR))
-            out.release()
+        # Save optical flow mask video. Squeeze to (T, H, W) first
+        optical_flow_mask = optical_flow_mask / 1.5 # normalize to [0, 1.0]
+        flow_np = (optical_flow_mask.squeeze(0).cpu().numpy() * 255).astype(np.uint8) # (T-1, H, W)
+        out_path = os.path.join(self.output_dir, f"{video_id}_flow_mask.avi")
+        out = cv2.VideoWriter(out_path, fourcc, 16, (width, height))
+        for frame in flow_np:
+            out.write(cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR))
+        out.release()
+
+        # Save identity image (png). Reshape to (H, W, C) and convert to uint8
+        identity_image_np = (identity_image.permute(1, 2, 0).cpu().numpy()).astype(np.uint8) # (H, W, C)
+        identity_image_path = os.path.join(self.output_dir, f"{video_id}_identity.png")
+        cv2.imwrite(identity_image_path, cv2.cvtColor(identity_image_np, cv2.COLOR_RGB2BGR))
 
         self.manifest.append({
-            "filepath": output_filename,
+            "video_id": video_id,
             "resolution": f"{width}x{height}",
         })
 
@@ -329,9 +331,7 @@ def main():
     parser = argparse.ArgumentParser(description="Preprocess training data for SkyReels-A1")
     parser.add_argument("--video_dir", type=str, required=True, help="Directory containing the video files")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the preprocessed data")
-    parser.add_argument("--waft_checkpoint", type=str, required=True, help="Path to the WAFT checkpoint file")
     parser.add_argument("--smirk_checkpoint", type=str, required=True, help="Path to the Smirk checkpoint file")
-    parser.add_argument("--save_videos", action="store_true", help="If set, save video files as well as raw tensors")
     parser.add_argument("--count", type=int, default=None, help="Maximum number of video files to process")
 
     args = parser.parse_args()

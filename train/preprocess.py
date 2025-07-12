@@ -173,62 +173,54 @@ class Preprocessor:
         return mask
 
     @torch.no_grad()
-    def optical_flow_mask(self, video_tensor):
+    def optical_flow_mask(self, video_tensor, batch_size=8):
         """
-        Given a video tensor, compute the optical flow, using WAFT, on each adjacent pair of frames
+        Given a video tensor, compute the optical flow, using WAFT, on each adjacent pair of frames in batches.
         Args:
             video_tensor (torch.Tensor): Video tensor of shape (C, T, H, W)
+            batch_size (int): Number of triplets per batch
         Returns:
             torch.Tensor: Optical flow field of shape (1, T - 2, H, W) 
         """
-
         _, T, H, W = video_tensor.shape
-        target_h, target_w = self.memfof_config.image_size
-        flow_mask = torch.zeros((1, T - 2, H, W), dtype=torch.float32, device=video_tensor.device)
 
-        fmap_cache = [None] * 3
-        for i in range(video_tensor.shape[1] - 2):
-            frame1 = video_tensor[:, i, :, :] # (3, H, W)
-            frame2 = video_tensor[:, i + 1, :, :] # (3, H, W)
+        # Create as (T - 2, 1, H, W)
+        flow_mask = torch.zeros((T - 2, 1, H, W), dtype=torch.float32, device=video_tensor.device)
+        triplets = []
+        indices = []
+        for i in range(T - 2):
+            frame1 = video_tensor[:, i, :, :]
+            frame2 = video_tensor[:, i + 1, :, :]
             frame3 = video_tensor[:, i + 2, :, :]
-
-            frames = torch.stack([frame1, frame2, frame3], dim=0)  # Shape (3, 3, H', W')
-            frames = frames * 255 # MEMFOF requires frames in [0, 255]
-            output = self.memfof_model(
-                frames.unsqueeze(0).to(device=self.device), # Add batch dimension, shape (1, 3, 3, H, W)
-                fmap_cache=fmap_cache,  # Cache for feature maps
-            )
-
-            flow = output['flow'][-1][:, 1].squeeze(0) # shape (2, H', W')
-            fmap_cache = output["fmap_cache"]
-            fmap_cache.pop(0)
-            fmap_cache.append(None)
-
-            # Convert flow to optical flow mask.
-            flow_magnitude = torch.sqrt(flow[0] ** 2 + flow[1] ** 2)  # shape (H, W)
-            maximum_magnitude = flow_magnitude.max().item() + 1e-8
-
-            # Normalize the flow to [0, 1]
-            flow_magnitude = flow_magnitude / maximum_magnitude
-
-            flow_magnitude = flow_magnitude.unsqueeze(0) # Shape (1, H, W)
-
-            avg_flow = flow_magnitude.mean().item()
-            high_flow_mask = flow_magnitude >= avg_flow
-
-            flow_magnitude = flow_magnitude * high_flow_mask.float() + 0.5
-            # set all items < 1.0 to 0 and clamp to 1.5
-            # this is the M_i,norm described in section 4.2 of the skyreels A1 paper.
-            # shape (1, H, W)
-            # though we diverge here and observe that we get slightly better values this way.
-            flow_magnitude[flow_magnitude < 0.75] = 0.0
-            flow_magnitude[flow_magnitude > 1.5] = 1.5
-
-            flow_mask[:, i, :, :] = flow_magnitude.cpu()
-            del output, flow, flow_magnitude
-            torch.cuda.empty_cache()
-
-        return flow_mask.float()
+            triplet = torch.stack([frame1, frame2, frame3], dim=0)  # (3, 3, H, W)
+            triplet = triplet * 255
+            triplets.append(triplet)
+            indices.append(i)
+            if len(triplets) == batch_size or i == T - 3:
+                batch = torch.stack(triplets, dim=0)  # (B, 3, 3, H, W)
+                output = self.memfof_model(batch.to(device=self.device), fmap_cache=None)
+                flows = output['flow'] # (B, 2, 2, H, W)
+                # use backward flow
+                flows = flows[:, 0]  # (B, 2, H, W)
+                # Vectorized flow magnitude calculation
+                flow_magnitude = torch.sqrt(flows[:, 0] ** 2 + flows[:, 1] ** 2)  # (B, H, W)
+                maximum_magnitude = torch.amax(flow_magnitude, dim=(1, 2), keepdim=True) + 1e-8  # (B, 1, 1)
+                # Normalize to [0, 1]
+                flow_magnitude = flow_magnitude / maximum_magnitude  # (B, H, W)
+                flow_magnitude = flow_magnitude.unsqueeze(1)  # (B, 1, H, W)
+                avg_flow = flow_magnitude.mean(dim=(2, 3), keepdim=True)  # (B, 1, 1, 1)
+                high_flow_mask = flow_magnitude >= avg_flow  # (B, 1, H, W)
+                # Follow SkyReels A1 section 4.2,
+                # We take the top 3/4 of the above-average flow magnitudes.
+                # The original paper takes only the top 1/2, but this gave better results anecdotally.
+                flow_magnitude = flow_magnitude * high_flow_mask.float() + 0.5
+                flow_magnitude[flow_magnitude < 0.75] = 0.0
+                # Assign to flow_mask
+                flow_mask[indices[0]:indices[-1]+1] = flow_magnitude
+                triplets = []
+                indices = []
+                torch.cuda.empty_cache()
+        return flow_mask.float().permute(1, 0, 2, 3)  # Reshape to (1, T-2, H, W)
 
 
     def cropped_aligned_identity(self, video_tensor):
@@ -271,7 +263,7 @@ class Preprocessor:
 
         driving_video, landmarks = self.facial_landmarks(frames_tensor)
         pixel_mask = self.pixel_mask(frames_tensor, landmarks)
-        optical_flow_mask = self.optical_flow_mask(frames_tensor)
+        optical_flow_mask = self.optical_flow_mask(frames_tensor, batch_size=self.args.optical_batch_size)
         identity_image = self.cropped_aligned_identity(frames_tensor)
 
         # Save original video. Permute to (T, H, W, C) for video saving
@@ -349,6 +341,7 @@ def main():
     parser.add_argument("--count", type=int, default=None, help="Maximum number of video files to process")
     parser.add_argument("--num_workers", type=int, default=1, help="Number of parallel workers for preprocessing")
     parser.add_argument("--early_exit", type=bool, default=False, help="Exit early after creating preprocessor")
+    parser.add_argument("--optical_batch_size", type=int, default=8, help="Batch size for optical flow mask computation")
     args = parser.parse_args()
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)

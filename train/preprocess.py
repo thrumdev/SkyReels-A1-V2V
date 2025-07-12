@@ -360,6 +360,9 @@ def main():
         chunks = np.array_split(video_files, args.num_workers)
         processes = []
         prev_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+
+        # Ensure processes are started with a full spawn.
+        multiprocessing.set_start_method('spawn', force=True)
         for worker_id, chunk in enumerate(chunks):
             # set environment for worker
             os.environ["CUDA_VISIBLE_DEVICES"] = str(worker_id)

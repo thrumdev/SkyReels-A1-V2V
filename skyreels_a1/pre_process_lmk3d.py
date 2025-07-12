@@ -25,6 +25,7 @@ class FaceAnimationProcessor:
         self.smirk_encoder = SmirkEncoder().to(device)
         self.flame = FLAME(n_shape=300, n_exp=50).to(device)
         self.renderer = Renderer().to(device)
+        self.mediapipe_utils = MediaPipeUtils()
         self.load_checkpoint(checkpoint)
 
     def load_checkpoint(self, checkpoint):
@@ -154,8 +155,7 @@ class FaceAnimationProcessor:
 
     def process_source_image(self, image_rgb, input_size=224):
         image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-        mediapipe_utils = MediaPipeUtils()
-        kpt_mediapipe, _, _, mediapipe_eye_pose = mediapipe_utils.run_mediapipe(image_bgr)
+        kpt_mediapipe, _, _, mediapipe_eye_pose = self.mediapipe_utils.run_mediapipe(image_bgr)
         if kpt_mediapipe is None:
             raise ValueError('Cannot find facial landmarks in the source image')
         kpt_mediapipe = kpt_mediapipe[..., :2]
@@ -182,13 +182,12 @@ class FaceAnimationProcessor:
         original_images = []
         weights_473 = []
         weights_468 = []
-        mediapipe_utils = MediaPipeUtils()
         mediapipe_landmarks = []
         for i, frame in enumerate(img_list):
             img_rgb = frame
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             try:
-                kpt_mediapipe, mediapipe_exp, mediapipe_pose, mediapipe_eye_pose = mediapipe_utils.run_mediapipe(frame)
+                kpt_mediapipe, mediapipe_exp, mediapipe_pose, mediapipe_eye_pose = self.mediapipe_utils.run_mediapipe(frame)
             except:
                 print('Warning: No face detected in a frame, skipping this frame')
                 driving_frames.append(None)

@@ -12,7 +12,8 @@ from skyreels_a1.pre_process_lmk3d import FaceAnimationProcessor
 from skyreels_a1.src.media_pipe.mp_utils  import LMKExtractor
 from skyreels_a1.src.media_pipe.draw_util_2d import FaceMeshVisualizer2d
 from facexlib.utils.face_restoration_helper import FaceRestoreHelper
-from tqdm import tqdm
+from time import sleep
+from tqdm import tqdm as tqdm_main
 
 from .memfof.core.memfof import MEMFOF
 
@@ -261,10 +262,14 @@ class Preprocessor:
 
         _, _, height, width = frames_tensor.shape
 
-        driving_video, landmarks = self.facial_landmarks(frames_tensor)
-        pixel_mask = self.pixel_mask(frames_tensor, landmarks)
-        optical_flow_mask = self.optical_flow_mask(frames_tensor, batch_size=self.args.optical_batch_size)
-        identity_image = self.cropped_aligned_identity(frames_tensor)
+        try:
+            driving_video, landmarks = self.facial_landmarks(frames_tensor)
+            pixel_mask = self.pixel_mask(frames_tensor, landmarks)
+            optical_flow_mask = self.optical_flow_mask(frames_tensor, batch_size=self.args.optical_batch_size)
+            identity_image = self.cropped_aligned_identity(frames_tensor)
+        except Exception as e:
+            print(f"[ERROR] Skipping video {video_path} due to error: {e}")
+            return
 
         # Save original video. Permute to (T, H, W, C) for video saving
         original_video_np = (frames_tensor.permute(1, 2, 3, 0).cpu().numpy() * 255).astype(np.uint8) # (T, H, W, C)
@@ -320,11 +325,15 @@ class Preprocessor:
             json.dump(self.manifest, f, indent=4)
         print(f"Manifest written to {manifest_path}")
 
-def worker_process(args, video_files, worker_id):
+def worker_process(args, video_queue, worker_id):
     print(f"Worker {worker_id} started with GPU {os.environ.get('CUDA_VISIBLE_DEVICES')}")
     device = "cuda:0"  # Only one GPU is visible to this process
     preprocessor = Preprocessor(args, device=device)
-    for video_file in tqdm(video_files, desc=f"Worker {worker_id} processing videos"): 
+    while True:
+        try:
+            video_file = video_queue.get(timeout=3)
+        except Exception:
+            break  # Queue is empty
         video_path = os.path.join(args.video_dir, video_file)
         preprocessor.preprocess_video(video_path)
     # Write worker manifest
@@ -332,6 +341,7 @@ def worker_process(args, video_files, worker_id):
     with open(manifest_path, "w") as f:
         json.dump(preprocessor.manifest, f, indent=4)
     print(f"Worker {worker_id} manifest written to {manifest_path}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Preprocess training data for SkyReels-A1")
@@ -349,19 +359,38 @@ def main():
     if args.count is not None:
         video_files = video_files[:args.count]
     if args.num_workers > 1 and not args.early_exit:
-        # Split video files into chunks
-        chunks = np.array_split(video_files, args.num_workers)
+        # Use a global queue for load balancing
+        video_queue = multiprocessing.Queue()
+        for f in video_files:
+            video_queue.put(f)
+
+        total_videos = len(video_files)
         processes = []
         prev_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
 
         # Ensure processes are started with a full spawn.
         multiprocessing.set_start_method('spawn', force=True)
-        for worker_id, chunk in enumerate(chunks):
-            # set environment for worker
+        for worker_id in range(args.num_workers):
+            # Set environment for worker.
             os.environ["CUDA_VISIBLE_DEVICES"] = str(worker_id)
-            p = multiprocessing.Process(target=worker_process, args=(args, list(chunk), worker_id))
+            p = multiprocessing.Process(target=worker_process, args=(args, video_queue, worker_id))
             p.start()
             processes.append(p)
+        # Start a tqdm progress bar in the main thread
+        pbar = tqdm_main(total=total_videos, desc="Preprocessing videos", position=0)
+        prev_remaining = total_videos
+        while any(p.is_alive() for p in processes):
+            remaining = video_queue.qsize()
+            processed = total_videos - remaining
+            if processed > prev_remaining - remaining:
+                pbar.update(processed - pbar.n)
+            prev_remaining = remaining
+            sleep(0.5)
+        # Final update in case some videos finished after last check
+        processed = total_videos - video_queue.qsize()
+        pbar.update(processed - pbar.n)
+        pbar.close()
+        video_queue.close()
         for p in processes:
             p.join()
 

@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import cv2
+import multiprocessing
 
 from skyreels_a1.pre_process_lmk3d import FaceAnimationProcessor
 from skyreels_a1.src.media_pipe.mp_utils  import LMKExtractor
@@ -327,26 +328,58 @@ class Preprocessor:
             json.dump(self.manifest, f, indent=4)
         print(f"Manifest written to {manifest_path}")
 
+def worker_process(args, video_files, worker_id):
+    # Each worker gets its own Preprocessor and manifest
+    preprocessor = Preprocessor(args)
+    for video_file in tqdm(video_files, desc=f"Worker {worker_id} processing videos"):
+        video_path = os.path.join(args.video_dir, video_file)
+        preprocessor.preprocess_video(video_path)
+    # Write worker manifest
+    manifest_path = os.path.join(args.output_dir, f"manifest_worker_{worker_id}.json")
+    with open(manifest_path, "w") as f:
+        json.dump(preprocessor.manifest, f, indent=4)
+    print(f"Worker {worker_id} manifest written to {manifest_path}")
+
 def main():
     parser = argparse.ArgumentParser(description="Preprocess training data for SkyReels-A1")
     parser.add_argument("--video_dir", type=str, required=True, help="Directory containing the video files")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the preprocessed data")
     parser.add_argument("--smirk_checkpoint", type=str, required=True, help="Path to the Smirk checkpoint file")
     parser.add_argument("--count", type=int, default=None, help="Maximum number of video files to process")
-
+    parser.add_argument("--num_workers", type=int, default=1, help="Number of parallel workers for preprocessing")
     args = parser.parse_args()
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
-
-    preprocessor = Preprocessor(args)
     video_files = [f for f in os.listdir(args.video_dir) if f.endswith('.mp4')]
     if args.count is not None:
         video_files = video_files[:args.count]
-    for video_file in tqdm(video_files, desc="Processing videos"):
-        video_path = os.path.join(args.video_dir, video_file)
-        preprocessor.preprocess_video(video_path)
-
-    preprocessor.write_manifest()
+    if args.num_workers > 1:
+        # Split video files into chunks
+        chunks = np.array_split(video_files, args.num_workers)
+        processes = []
+        for worker_id, chunk in enumerate(chunks):
+            p = multiprocessing.Process(target=worker_process, args=(args, list(chunk), worker_id))
+            p.start()
+            processes.append(p)
+        for p in processes:
+            p.join()
+        # Merge manifests
+        merged_manifest = []
+        for worker_id in range(args.num_workers):
+            manifest_path = os.path.join(args.output_dir, f"manifest_worker_{worker_id}.json")
+            with open(manifest_path, "r") as f:
+                merged_manifest.extend(json.load(f))
+            os.remove(manifest_path)
+        manifest_path = os.path.join(args.output_dir, "manifest.json")
+        with open(manifest_path, "w") as f:
+            json.dump(merged_manifest, f, indent=4)
+        print(f"Final manifest written to {manifest_path}")
+    else:
+        preprocessor = Preprocessor(args)
+        for video_file in tqdm(video_files, desc="Processing videos"):
+            video_path = os.path.join(args.video_dir, video_file)
+            preprocessor.preprocess_video(video_path)
+        preprocessor.write_manifest()
 
 
 if __name__ == "__main__":

@@ -376,27 +376,31 @@ def main():
             p = multiprocessing.Process(target=worker_process, args=(args, video_queue, worker_id))
             p.start()
             processes.append(p)
+
+        # Restore original CUDA_VISIBLE_DEVICES
+        if prev_cuda_visible_devices is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible_devices
+
         # Start a tqdm progress bar in the main thread
         pbar = tqdm_main(total=total_videos, desc="Preprocessing videos", position=0)
         prev_remaining = total_videos
-        while any(p.is_alive() for p in processes):
+        while video_queue.qsize() > 0 or any(p.is_alive() for p in processes):
             remaining = video_queue.qsize()
             processed = total_videos - remaining
             if processed > prev_remaining - remaining:
                 pbar.update(processed - pbar.n)
             prev_remaining = remaining
             sleep(0.5)
+
+        print("Finished processing all videos. Waiting for workers to finish...")
         # Final update in case some videos finished after last check
-        processed = total_videos - video_queue.qsize()
+        processed = total_videos
         pbar.update(processed - pbar.n)
         pbar.close()
         video_queue.close()
         for p in processes:
             p.join()
 
-        # Restore original CUDA_VISIBLE_DEVICES
-        if prev_cuda_visible_devices is not None:
-            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible_devices
         # Merge manifests
         merged_manifest = []
         for worker_id in range(args.num_workers):

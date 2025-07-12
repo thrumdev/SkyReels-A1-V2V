@@ -198,7 +198,7 @@ class Preprocessor:
             indices.append(i)
             if len(triplets) == batch_size or i == T - 3:
                 batch = torch.stack(triplets, dim=0)  # (B, 3, 3, H, W)
-                output = self.memfof_model(batch.to(device=self.device), fmap_cache=None)
+                output = self.memfof_model(batch.to(device=self.device), fmap_cache=[None, None, None])
                 flows = output['flow'] # (B, 2, 2, H, W)
                 # use backward flow
                 flows = flows[:, 0]  # (B, 2, H, W)

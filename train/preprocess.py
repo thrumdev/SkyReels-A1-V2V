@@ -77,20 +77,21 @@ class MEMFOFConfig:
         self.coarse_config = coarse_config
 
 class Preprocessor:
-    def __init__(self, args):
+    def __init__(self, args, device='cuda'):
         self.video_dir = args.video_dir
         self.output_dir = args.output_dir
         
         self.lmk_extractor = LMKExtractor()
         self.processor = FaceAnimationProcessor(checkpoint=args.smirk_checkpoint)
         self.face_vis = FaceMeshVisualizer2d(forehead_edge=False, draw_head=False, draw_iris=False,)
-        self.face_helper = FaceRestoreHelper(upscale_factor=1, face_size=512, crop_ratio=(1, 1), det_model='retinaface_resnet50', save_ext='png', device="cuda",)
+        self.face_helper = FaceRestoreHelper(upscale_factor=1, face_size=512, crop_ratio=(1, 1), det_model='retinaface_resnet50', save_ext='png', device=device)
         self.manifest = []
 
         # Load MEMFOF for optical flow calculation.
         self.memfof_config = MEMFOFConfig()
-        self.memfof_model = MEMFOF.from_pretrained(f"egorchistov/optical-flow-{MEMFOF_MODEL}").eval().cuda()
+        self.memfof_model = MEMFOF.from_pretrained(f"egorchistov/optical-flow-{MEMFOF_MODEL}").eval().to(device=device)
         self.args = args
+        self.device = device
 
     def facial_landmarks(self, control_frames):
         """
@@ -194,7 +195,7 @@ class Preprocessor:
             frames = torch.stack([frame1, frame2, frame3], dim=0)  # Shape (3, 3, H', W')
             frames = frames * 255 # MEMFOF requires frames in [0, 255]
             output = self.memfof_model(
-                frames.unsqueeze(0).to("cuda"), # Add batch dimension, shape (1, 3, 3, H, W)
+                frames.unsqueeze(0).to(device=self.device), # Add batch dimension, shape (1, 3, 3, H, W)
                 fmap_cache=fmap_cache,  # Cache for feature maps
             )
 
@@ -328,9 +329,10 @@ class Preprocessor:
         print(f"Manifest written to {manifest_path}")
 
 def worker_process(args, video_files, worker_id):
-    # Each worker gets its own Preprocessor and manifest
-    preprocessor = Preprocessor(args)
-    for video_file in tqdm(video_files, desc=f"Worker {worker_id} processing videos"):
+    print(f"Worker {worker_id} started with GPU {os.environ.get('CUDA_VISIBLE_DEVICES')}")
+    device = "cuda:0"  # Only one GPU is visible to this process
+    preprocessor = Preprocessor(args, device=device)
+    for video_file in tqdm(video_files, desc=f"Worker {worker_id} processing videos"): 
         video_path = os.path.join(args.video_dir, video_file)
         preprocessor.preprocess_video(video_path)
     # Write worker manifest
@@ -346,22 +348,30 @@ def main():
     parser.add_argument("--smirk_checkpoint", type=str, required=True, help="Path to the Smirk checkpoint file")
     parser.add_argument("--count", type=int, default=None, help="Maximum number of video files to process")
     parser.add_argument("--num_workers", type=int, default=1, help="Number of parallel workers for preprocessing")
+    parser.add_argument("--early_exit", type=bool, default=False, help="Exit early after creating preprocessor")
     args = parser.parse_args()
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
     video_files = [f for f in os.listdir(args.video_dir) if f.endswith('.mp4')]
     if args.count is not None:
         video_files = video_files[:args.count]
-    if args.num_workers > 1:
+    if args.num_workers > 1 and not args.early_exit:
         # Split video files into chunks
         chunks = np.array_split(video_files, args.num_workers)
         processes = []
+        prev_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
         for worker_id, chunk in enumerate(chunks):
+            # set environment for worker
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(worker_id)
             p = multiprocessing.Process(target=worker_process, args=(args, list(chunk), worker_id))
             p.start()
             processes.append(p)
         for p in processes:
             p.join()
+
+        # Restore original CUDA_VISIBLE_DEVICES
+        if prev_cuda_visible_devices is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible_devices
         # Merge manifests
         merged_manifest = []
         for worker_id in range(args.num_workers):
@@ -375,6 +385,10 @@ def main():
         print(f"Final manifest written to {manifest_path}")
     else:
         preprocessor = Preprocessor(args)
+        if args.early_exit:
+            print("Early exit requested, preprocessor created but no videos processed.")
+            return
+        
         for video_file in tqdm(video_files, desc="Processing videos"):
             video_path = os.path.join(args.video_dir, video_file)
             preprocessor.preprocess_video(video_path)

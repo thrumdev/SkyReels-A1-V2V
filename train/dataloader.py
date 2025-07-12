@@ -7,6 +7,7 @@ import torch
 import numpy as np
 import cv2
 from decord import VideoReader
+from omegaconf import OmegaConf
 
 def load_manifest(data_dir_path):
     """
@@ -46,10 +47,9 @@ class BucketBatchSampler(Sampler):
 
 
 class SkyReelsV2VDataset(Dataset):
-    def __init__(self, config):
-        self.config = config
-        self.manifest = load_manifest(config.data_dir)
-        self.data_dir = config.data_dir
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self.manifest = load_manifest(data_dir)
 
     def __len__(self):
         return len(self.manifest)
@@ -97,6 +97,9 @@ class SkyReelsV2VDataset(Dataset):
         }
 
 
-def get_dataloader(config):
-    dataset = SkyReelsV2VDataset(config)
+def get_dataloader(data_dir, config):
+    """
+    Returns a DataLoader for the given data_dir and config.
+    """
+    dataset = SkyReelsV2VDataset(data_dir)
     return DataLoader(dataset, batch_sampler=BucketBatchSampler(config))

@@ -4,7 +4,7 @@ import json
 from decord import VideoReader
 import torch
 import torch.nn.functional as F
-import np
+import numpy as np
 import cv2
 
 from skyreels_a1.pre_process_lmk3d import FaceAnimationProcessor
@@ -13,49 +13,57 @@ from skyreels_a1.src.media_pipe.draw_util_2d import FaceMeshVisualizer2d
 from facexlib.utils.face_restoration_helper import FaceRestoreHelper
 from tqdm import tqdm
 
-from .WAFT.model import fetch_model as fetch_waft_model
-from .WAFT.inference_tools import InferenceWrapper as WaftInferenceWrapper
-from .WAFT.utils.utils import load_ckpt as load_waft_ckpt
+from .memfof.core.memfof import MEMFOF
 
-# copied from tar-c-t-spring-540p.json
-class WaftConfig:
+MEMFOF_MODEL = "MEMFOF-Tartan-T-TSKH"
+
+# copied from tartan-t-tskh.json
+class MEMFOFConfig:
     def __init__(
         self,
-        name="tar-c-t-spring-540p",
-        dataset="spring",
-        gpus=None,
-        dav2_backbone="vits",
-        network_backbone="vits",
-        algorithm="vitwarp",
+        name="Tartan-T-TSKH",
+        dataset="TSKH-full",
+        val_datasets=None,
+        monitor=None,
         use_var=True,
         var_min=0,
         var_max=10,
-        iters=5,
+        pretrain="resnet34",
+        radius=4,
+        dim=512,
+        num_blocks=2,
+        iters=4,
         image_size=None,
-        scale=-1,
-        batch_size=32,
+        scale=1,
+        effective_batch_size=32,
+        num_workers=16,
         epsilon=1e-8,
-        lr=1e-4,
+        lr=7e-5,
         wdecay=1e-5,
         dropout=0,
         clip=1.0,
         gamma=0.85,
-        num_steps=200000,
-        restore_ckpt=None
+        num_steps=225000,
+        val_steps=7500,
+        restore_ckpt="ckpts/Tartan-T",
+        coarse_config=None
     ):
         self.name = name
         self.dataset = dataset
-        self.gpus = gpus if gpus is not None else [0, 1, 2, 3, 4, 5, 6, 7]
-        self.dav2_backbone = dav2_backbone
-        self.network_backbone = network_backbone
-        self.algorithm = algorithm
+        self.val_datasets = val_datasets if val_datasets is not None else ["spring", "spring-1080", "sintel", "kitti"]
+        self.monitor = monitor
         self.use_var = use_var
         self.var_min = var_min
         self.var_max = var_max
+        self.pretrain = pretrain
+        self.radius = radius
+        self.dim = dim
+        self.num_blocks = num_blocks
         self.iters = iters
-        self.image_size = image_size if image_size is not None else [540, 960]
+        self.image_size = image_size if image_size is not None else [864, 1920]
         self.scale = scale
-        self.batch_size = batch_size
+        self.effective_batch_size = effective_batch_size
+        self.num_workers = num_workers
         self.epsilon = epsilon
         self.lr = lr
         self.wdecay = wdecay
@@ -63,9 +71,9 @@ class WaftConfig:
         self.clip = clip
         self.gamma = gamma
         self.num_steps = num_steps
+        self.val_steps = val_steps
         self.restore_ckpt = restore_ckpt
-
-waft_config = WaftConfig()
+        self.coarse_config = coarse_config
 
 class Preprocessor:
     def __init__(self, args):
@@ -78,26 +86,28 @@ class Preprocessor:
         self.face_helper = FaceRestoreHelper(upscale_factor=1, face_size=512, crop_ratio=(1, 1), det_model='retinaface_resnet50', save_ext='png', device="cuda",)
         self.manifest = []
 
-        # Load WAFT for optical flow
-        self.waft_config = waft_config
-        self.waft_model = fetch_waft_model(waft_config)
-        load_waft_ckpt(self.waft_model, args.waft_checkpoint)
-        self.waft_model.cuda()
-        self.waft_model.eval()
-        self.waft_model = WaftInferenceWrapper(
-            self.waft_model, 
-            scale=waft_config.scale, 
-            train_size=waft_config.image_size,
-            pad_to_train_size=False,
-            tiling=False,
-        )
+        # Load MEMFOF for optical flow calculation.
+        self.memfof_config = MEMFOFConfig()
+        self.memfof_model = MEMFOF.from_pretrained(f"egorchistov/optical-flow-{MEMFOF_MODEL}").eval().cuda()
         self.args = args
 
     def facial_landmarks(self, control_frames):
+        """
+        Get the facial landmark driving video.
+        Args:
+            control_frames (torch.Tensor): Tensor of shape (C, T, H, W)
+        Returns:
+            driving_video (torch.Tensor): shape (C, T, H, W)
+        """
         driving_video_crop = []
         ref_faces = []
-        for control_frame in control_frames:
-            ref_image, x1, y1 = self.processor.face_crop(np.array(control_frame))
+        # Iterate over the temporal dimension (T) of control_frames
+        T = control_frames.shape[1]
+        for t in range(T):
+            control_frame = control_frames[:, t, :, :]
+            frame_np = control_frame.permute(1, 2, 0).cpu().numpy()
+            frame_np = (frame_np * 255).astype(np.uint8)
+            ref_image, x1, y1 = self.processor.face_crop(frame_np)
             ref_faces.append((ref_image, x1, y1))
             driving_video_crop.append(ref_image)
 
@@ -106,70 +116,91 @@ class Preprocessor:
         # The original SkyReels A1 inference code separates the first frame and the subsequent frames,
         # but in our self-reenactment approach they are the same. therefore we can populate it more
         # similarly.
-        out_frames = self.processor.preprocess_lmk3d_multi(driving_video, driving_video)
+        out_frames, landmarks = self.processor.preprocess_lmk3d_self_reenactment(driving_video)
         
-        input_video = np.zeros(control_frames[0].shape, dtype=np.float32)[np.newaxis, :].repeat(49, axis=0)
-        for ii in range(49):
+        n_frames = len(out_frames)
+        c, h, w = control_frames[:, 0, :, :].shape
+        input_video = np.zeros((h, w, c), dtype=np.float32)[np.newaxis, :].repeat(n_frames, axis=0)
+        for ii in range(n_frames):
             ref_face, x1, y1 = ref_faces[ii]
             face_h, face_w, _ = ref_face.shape
             input_video[ii][y1:y1+face_h, x1:x1+face_w] = out_frames[ii]
+
+            if landmarks[ii] is not None:
+                # add (x1, y1) to all items in landmarks
+                landmarks[ii][:, 0] += x1
+                landmarks[ii][:, 1] += y1
 
         # concat with remaining motion frames.
         input_video = torch.from_numpy(np.array(input_video))
         input_video = input_video / 255
         # reshape input video to [C, T, H, W]
-        input_video = input_video.permute(1, 0, 2, 3)
+        input_video = input_video.permute(3, 0, 1, 2)
 
-        return input_video
+        return input_video, landmarks
     
-    def pixel_mask(self, video_tensor):
+    def pixel_mask(self, video_tensor, landmarks):
         """
         Given a video tensor, produce a pixel mask which covers the face region for each frame.
         Args:
             video_tensor (torch.Tensor): Video tensor of shape (C, T, H, W).
+            landmarks (list): List of landmarks for each frame, where each item is either None
+            or a numpy array of shape (N, 2) containing the (x, y) coordinates of the landmarks.
+            None means that mediapipe didn't find any landmarks for that frame.
         Returns:
             torch.Tensor: Pixel mask of shape (1, T, H, W) where 1 indicates inside the face region, 0 otherwise.
         """
         C, T, H, W = video_tensor.shape
         mask = torch.zeros((1, T, H, W), dtype=torch.float32, device=video_tensor.device)
         for i in range(T):
-            face_mask = self.processor.face_mask(video_tensor[i])
+            if landmarks[i] is None:
+                # If no landmarks were found, skip this frame. Treat the entire frame as masked
+                mask[:, i, :, :] = 1.0
+                continue
+
+            image = video_tensor[:, i, :, :].permute(1, 2, 0)  # (H, W, C)
+            image = image.cpu().numpy() * 255
+            image = image.astype(np.uint8)
+            face_mask = np.zeros((H, W), dtype=np.uint8)
+            hull = cv2.convexHull(landmarks[i].astype(np.int32))
+            cv2.fillPoly(face_mask, [hull], 1)
+            # transform face_mask into a torch tensor of shape [1, H, W]
+            face_mask = torch.tensor(face_mask, dtype=torch.float32, device=video_tensor.device)
+            face_mask = face_mask.unsqueeze(0)  # shape (1, H, W)
             mask[0, i, :, :] = face_mask
         return mask
 
+    @torch.no_grad()
     def optical_flow_mask(self, video_tensor):
         """
         Given a video tensor, compute the optical flow, using WAFT, on each adjacent pair of frames
         Args:
             video_tensor (torch.Tensor): Video tensor of shape (C, T, H, W)
         Returns:
-            torch.Tensor: Optical flow field of shape (1, T - 1, H, W) 
+            torch.Tensor: Optical flow field of shape (1, T - 2, H, W) 
         """
 
         _, T, H, W = video_tensor.shape
-        flow_mask = torch.zeros((1, T - 1, H, W), dtype=torch.float32, device=video_tensor.device)
-        for i in range(video_tensor.shape[1] - 1):
-            frame1 = video_tensor[:, i, :, :] # (C, H, W)
-            frame2 = video_tensor[:, i + 1, :, :]
+        target_h, target_w = self.memfof_config.image_size
+        flow_mask = torch.zeros((1, T - 2, H, W), dtype=torch.float32, device=video_tensor.device)
 
-            # Scale frame1 and frame2 to the waft config desired image size.
-            frame1 = F.interpolate(
-                frame1.unsqueeze(0), 
-                size=self.waft_config.image_size, 
-                mode='bilinear', 
-                align_corners=False
-            ).squeeze(0)
-            frame2 = F.interpolate(
-                frame2.unsqueeze(0), 
-                size=self.waft_config.image_size, 
-                mode='bilinear', 
-                align_corners=False
-            ).squeeze(0)
+        fmap_cache = [None] * 3
+        for i in range(video_tensor.shape[1] - 2):
+            frame1 = video_tensor[:, i, :, :] # (3, H, W)
+            frame2 = video_tensor[:, i + 1, :, :] # (3, H, W)
+            frame3 = video_tensor[:, i + 2, :, :]
 
-            output = self.waft_model.calc_flow(frame1, frame2)
+            frames = torch.stack([frame1, frame2, frame3], dim=0)  # Shape (3, 3, H', W')
+            frames = frames * 255 # MEMFOF requires frames in [0, 255]
+            output = self.memfof_model(
+                frames.unsqueeze(0).to("cuda"), # Add batch dimension, shape (1, 3, 3, H, W)
+                fmap_cache=fmap_cache,  # Cache for feature maps
+            )
 
-            # Output contains `waft_config.iters` items. last is best.
-            flow = output['flow'][-1][0] # shape (2, H, W)
+            flow = output['flow'][-1][:, 1].squeeze(0) # shape (2, H', W')
+            fmap_cache = output["fmap_cache"]
+            fmap_cache.pop(0)
+            fmap_cache.append(None)
 
             # Convert flow to optical flow mask.
             flow_magnitude = torch.sqrt(flow[0] ** 2 + flow[1] ** 2)  # shape (H, W)
@@ -177,10 +208,8 @@ class Preprocessor:
 
             # Normalize the flow to [0, 1]
             flow_magnitude = flow_magnitude / maximum_magnitude
-            flow_magnitude = flow_magnitude.unsqueeze(0)  # shape (1, H, W)
 
-            # Scale back to original size.
-            flow_magnitude = F.interpolate(flow_magnitude, size=(H, W), mode='bilinear', align_corners=False)
+            flow_magnitude = flow_magnitude.unsqueeze(0) # Shape (1, H, W)
 
             avg_flow = flow_magnitude.mean().item()
             high_flow_mask = flow_magnitude >= avg_flow
@@ -189,10 +218,13 @@ class Preprocessor:
             # set all items < 1.0 to 0 and clamp to 1.5
             # this is the M_i,norm described in section 4.2 of the skyreels A1 paper.
             # shape (1, H, W)
-            flow_magnitude[flow_magnitude < 1.0] = 0.0
+            # though we diverge here and observe that we get slightly better values this way.
+            flow_magnitude[flow_magnitude < 0.75] = 0.0
             flow_magnitude[flow_magnitude > 1.5] = 1.5
 
-            flow_mask[:, i, :, :] = flow_magnitude
+            flow_mask[:, i, :, :] = flow_magnitude.cpu()
+            del output, flow, flow_magnitude
+            torch.cuda.empty_cache()
 
         return flow_mask.float()
 
@@ -211,7 +243,7 @@ class Preprocessor:
         image_face = align_face[:, :, ::-1]
 
         # convert to pytorch
-        image_face = torch.from_numpy(image_face).permute(2, 0, 1)
+        image_face = torch.from_numpy(image_face.copy()).permute(2, 0, 1)
 
         # note: we keep the range in 0, 255
         return image_face
@@ -226,19 +258,19 @@ class Preprocessor:
             video_path (str): Path to the video file to preprocess.
         """
 
-        video_filename = video_path.split("/")[-1]
+        video_filename = os.path.splitext(video_path.split("/")[-1])[0]
         output_filename = f"{video_filename}.pt"
         output_file = os.path.join(self.output_dir, output_filename)
 
         video = VideoReader(video_path, num_threads=1)
         frames = video.get_batch(range(len(video))).asnumpy()  # Load all frames as numpy array
-        frames_tensor = torch.tensor(frames).permute(0, 3, 1, 2) # Shape is now (C, T, H, W)
+        frames_tensor = torch.tensor(frames).permute(3, 0, 1, 2) # Shape is now (C, T, H, W)
         frames_tensor = frames_tensor.float() / 255.0
 
         _, _, height, width = frames_tensor.shape
 
-        driving_video = self.facial_landmarks(frames_tensor)
-        pixel_mask = self.pixel_mask(frames_tensor)
+        driving_video, landmarks = self.facial_landmarks(frames_tensor)
+        pixel_mask = self.pixel_mask(frames_tensor, landmarks)
         optical_flow_mask = self.optical_flow_mask(frames_tensor)
 
         with open(output_file, "wb") as f:
@@ -252,27 +284,28 @@ class Preprocessor:
 
         # Save processed videos if requested
         if getattr(self.args, 'save_videos', False):
-            # Save driving video
+            # Save driving video. Permute to (T, H, W, C) for video saving
             driving_video_np = (driving_video.permute(1, 2, 3, 0).cpu().numpy() * 255).astype(np.uint8) # (T, H, W, C)
             out_path = os.path.join(self.output_dir, f"{video_filename}_driving.mp4")
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(out_path, fourcc, 25, (width, height))
+            out = cv2.VideoWriter(out_path, fourcc, 16, (width, height))
             for frame in driving_video_np:
                 out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             out.release()
 
-            # Save pixel mask video
-            mask_np = (pixel_mask.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8) # (T, H, W)
+            # Save pixel mask video. Squeeze to (T, H, W) first
+            mask_np = (pixel_mask.squeeze(0).cpu().numpy() * 255).astype(np.uint8) # (T, H, W)
             out_path = os.path.join(self.output_dir, f"{video_filename}_mask.mp4")
-            out = cv2.VideoWriter(out_path, fourcc, 25, (width, height))
+            out = cv2.VideoWriter(out_path, fourcc, 16, (width, height))
             for frame in mask_np:
                 out.write(cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR))
             out.release()
 
-            # Save optical flow mask video
-            flow_np = (optical_flow_mask.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8) # (T-1, H, W)
+            # Save optical flow mask video. Squeeze to (T, H, W) first
+            optical_flow_mask = optical_flow_mask / 1.5 # normalize to [0, 1.0]
+            flow_np = (optical_flow_mask.squeeze(0).cpu().numpy() * 255).astype(np.uint8) # (T-1, H, W)
             out_path = os.path.join(self.output_dir, f"{video_filename}_flow_mask.mp4")
-            out = cv2.VideoWriter(out_path, fourcc, 25, (width, height))
+            out = cv2.VideoWriter(out_path, fourcc, 16, (width, height))
             for frame in flow_np:
                 out.write(cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR))
             out.release()

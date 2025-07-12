@@ -209,7 +209,7 @@ class SkyReelsA1V2VInpaintPipeline:
             ref_videos: List of reference video tensors (C, T, H, W)
             driving_videos: List of driving video tensors (C, T, H, W)
             pixel_masks: List of pixel mask tensors (1, T, H, W)
-            optical_flow_masks: List of optical flow mask tensors (1, T-1, H, W)
+            optical_flow_masks: List of optical flow mask tensors (1, T-2, H, W)
             identity_images: List of identity images (H, W)
             timesteps: List of timesteps
             height: Height of the input videos
@@ -296,7 +296,7 @@ class SkyReelsA1V2VInpaintPipeline:
             noise_gt: Ground truth noise tensor, same shape as noise_pred
             latent_mask: Binary mask tensor, (B, 1, T', H', W') where 1=inside mask, 0=outside.
                 intermediate values indicate partial masking within the latent subpixel.
-            optical_flow_mask: List of optical B flow mask tensors for the reference video (1, T-1, H, W)
+            optical_flow_mask: List of optical B flow mask tensors for the reference video (1, T-2, H, W)
                 these contain values either of [1.0, 1.5] or [0].
             
         Note that H' and W' are the latent dimensions, which are smaller than the original dimensions

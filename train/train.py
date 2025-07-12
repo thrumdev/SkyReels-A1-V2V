@@ -90,7 +90,7 @@ class Trainer:
                 ref_videos[i] = ref_videos[i][:, start_frame:start_frame + frames, :, :]
                 driving_videos[i] = driving_videos[i][:, start_frame:start_frame + frames, :, :]
                 masks[i] = masks[i][:, start_frame:start_frame + frames, :, :]
-                optical_flow_masks[i] = optical_flow_masks[i][:, start_frame:start_frame + frames - 1, :, :]
+                optical_flow_masks[i] = optical_flow_masks[i][:, start_frame:start_frame + frames - 2, :, :]
 
         # Expand the masks by a random amount.
         max_expand = self.config.get("max_mask_expand", 0)

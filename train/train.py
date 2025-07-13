@@ -79,7 +79,7 @@ class Trainer:
         device = self.accelerator.device
         self.pipeline = SkyReelsA1V2VInpaintPipeline(config, device)
         self.pipeline.transformer.train()
-        self.pipeline.transformer.requires_grad_(True)
+        self.pipeline.transformer.requires_grad_(False)
 
         # LoRA PEFT setup
         lora_rank = config.get("lora_rank")
@@ -88,15 +88,23 @@ class Trainer:
             use_rslora = config.get("use_rslora", False)
             lora_config = LoraConfig(r=lora_rank, use_rslora=use_rslora, target_modules=".*") 
             self.pipeline.transformer = get_peft_model(self.pipeline.transformer, lora_config)
-        self.pipeline.transformer.print_trainable_parameters()
+        else:
+            print("Training without LoRA")
+            self.pipeline.transformer.requires_grad_(True)
 
         if config.get("gradient_checkpointing", False):
             print("Enabling gradient checkpointing")
             self.pipeline.transformer._set_gradient_checkpointing(True)
 
+        for name, param in self.pipeline.transformer.named_parameters():
+            if param.requires_grad and self.accelerator.is_main_process:
+                print(f"Trainable parameter: {name} - {param.shape}")
+
         # Create optimizer out of all trained parameters.
-        lora_params = filter(lambda p: p.requires_grad, self.pipeline.transformer.parameters())
-        optimizer = torch.optim.AdamW(lora_params, lr=config.get("learning_rate", 1e-4))
+        trained_params = filter(lambda p: p.requires_grad, self.pipeline.transformer.parameters())
+        optimizer = torch.optim.AdamW(trained_params, lr=config.get("learning_rate", 1e-4))
+
+        self.pipeline.transformer = torch.compile(self.pipeline.transformer)
 
         # Prepare model, dataloader, and optimizer for distributed/accelerated training
         self.pipeline.transformer, self.dataloader, self.optimizer = self.accelerator.prepare(self.pipeline.transformer, self.dataloader, optimizer)

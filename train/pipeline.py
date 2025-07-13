@@ -309,20 +309,24 @@ class SkyReelsA1V2VInpaintPipeline:
               the combined mask M, and averaged over all latent pixels.
 
         We average over the _total_ number of pixels, following the definition of the face-aware
-        loss in the SkyReels-A1 paper (section 4.2)
+        loss in the SkyReels-A1 paper (section 4.2) with a few modifications.
 
         Steps 1 and 2 are no_grad.
         """
 
         with torch.no_grad():
             target_shape = noise_pred.shape[-3:]
-            optical_flow_mask = torch.stack(optical_flow_mask, dim=0)  # (B, 1, T-1, H, W)
+            optical_flow_mask = torch.stack(optical_flow_mask, dim=0)  # (B, 1, T-2, H, W)
             mask = torch.nn.functional.interpolate(
                 optical_flow_mask.float(),
                 size=target_shape,
                 mode='trilinear',
                 align_corners=False
             )
+            # set all values in mask to at least 0.1.
+            # this is again a divergence from skyreels-a1, but i believe we will want at least
+            # some training signal to reach the 'low-motion' face pixels.
+            mask = torch.clamp(mask, min=0.1)
 
         combined_mask = mask * latent_mask.float()
         loss = ((noise_pred.float() - noise_gt.float()) ** 2) * combined_mask

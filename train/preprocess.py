@@ -359,8 +359,9 @@ def main():
     if args.count is not None:
         video_files = video_files[:args.count]
     if args.num_workers > 1 and not args.early_exit:
-        # Use a global queue for load balancing
-        video_queue = multiprocessing.Queue()
+        # Use a global manager queue for load balancing
+        manager = multiprocessing.Manager()
+        video_queue = manager.Queue()
         for f in video_files:
             video_queue.put(f)
 
@@ -390,6 +391,7 @@ def main():
             if processed > prev_remaining - remaining:
                 pbar.update(processed - pbar.n)
             prev_remaining = remaining
+            pbar.refresh()
             sleep(0.5)
 
         print("Finished processing all videos. Waiting for workers to finish...")
@@ -397,7 +399,6 @@ def main():
         processed = total_videos
         pbar.update(processed - pbar.n)
         pbar.close()
-        video_queue.close()
         for p in processes:
             p.join()
 

@@ -114,7 +114,7 @@ class Trainer:
         self.validation_data_dir = config.get("validation_data_dir", None)
         self.validation_dataloader = None
         if self.validation_data_dir:
-            self.validation_dataloader = get_dataloader(self.validation_data_dir, config, world_size=world_size, rank=rank, seed=seed)
+            self.validation_dataloader = get_dataloader(self.validation_data_dir, config, mode="val", world_size=world_size, rank=rank, seed=seed)
 
         # Gradient accumulation setup
         self.gradient_accumulation_steps = config.get("gradient_accumulation_steps", 1)

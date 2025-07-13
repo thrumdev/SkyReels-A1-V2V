@@ -9,18 +9,18 @@ import cv2
 from decord import VideoReader
 from omegaconf import OmegaConf
 
-def load_manifest(data_dir_path):
+def load_manifest(data_dir_path, mode="train"):
     """
     Load the manifest file from the specified directory.
     The manifest is expected to be a JSON file containing a list of items.
     Each item should have a 'filepath' key pointing to the data file.
     """
-    manifest_path = f"{data_dir_path}/manifest.json"
+    manifest_path = f"{data_dir_path}/manifest_{mode}.json"
     with open(manifest_path, "r") as f:
         return json.load(f)
 
 class BucketBatchSampler(Sampler):
-    def __init__(self, config, world_size=1, rank=0, seed=42):
+    def __init__(self, config, mode="train", world_size=1, rank=0, seed=42):
         self.config = config
         self.batch_size = config.get("batch_size", 1)
         self.manifest = load_manifest(config.data_dir)
@@ -116,9 +116,9 @@ class SkyReelsV2VDataset(Dataset):
         }
 
 
-def get_dataloader(data_dir, config, world_size=1, rank=0, seed=42):
+def get_dataloader(data_dir, config, mode="train", world_size=1, rank=0, seed=42):
     """
     Returns a DataLoader for the given data_dir and config.
     """
     dataset = SkyReelsV2VDataset(data_dir)
-    return DataLoader(dataset, batch_sampler=BucketBatchSampler(config, world_size=world_size, rank=rank, seed=seed))
+    return DataLoader(dataset, batch_sampler=BucketBatchSampler(config, mode="mode", world_size=world_size, rank=rank, seed=seed))

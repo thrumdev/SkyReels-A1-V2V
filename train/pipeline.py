@@ -10,7 +10,7 @@ from einops import rearrange
 
 from typing import Tuple
 
-from ..skyreels_a1.models.transformer3d import CogVideoXTransformer3DModel
+from skyreels_a1.models.transformer3d import CogVideoXTransformer3DModel
 
 # Similar to diffusers.pipelines.hunyuandit.pipeline_hunyuandit.get_resize_crop_region_for_grid
 def get_resize_crop_region_for_grid(src, tgt_width, tgt_height):
@@ -35,33 +35,34 @@ class SkyReelsA1V2VInpaintPipeline:
         self.config = config
         model_name = config.get("model_path", "pretrained_models/SkyReels-A1-5B")
         siglip_name = config.get("siglip_path", "pretrained_models/SkyReels-A1-5B/siglip-so400m-patch14-384")
-        self.dtype = config.get("dtype", "bfloat16")
+        self.dtype = getattr(torch, config.get("dtype", "bfloat16"))
         self.device = device
 
         self.transformer = CogVideoXTransformer3DModel.from_pretrained(
             model_name,
             subfolder="transformer",
-        ).to(self.dtype, device)
+        ).to(device, self.dtype)
 
-        self.transformer.expand_proj_channels(48 + 64) # Add the mask channels if necessary.
+        self.transformer.patch_embed.expand_proj_channels(48 + 64) # Add the mask channels if necessary.
 
         self.vae = AutoencoderKLCogVideoX.from_pretrained(
             model_name, 
             subfolder="vae"
-        ).to(self.dtype, device)
+        ).to(device, self.dtype)
+        self.vae.enable_tiling()
 
         self.lmk_encoder = AutoencoderKLCogVideoX.from_pretrained(
             model_name, 
             subfolder="pose_guider",
-        ).to(self.dtype, device)
+        ).to(device, self.dtype)
 
         self.scheduler = CogVideoXDDIMScheduler.from_pretrained(
             model_name,
             subfolder="scheduler"
         )
 
-        self.siglip = SiglipVisionModel.from_pretrained(siglip_name).to(self.dtype, device)
-        self.siglip_normalize = SiglipImageProcessor.from_pretrained(siglip_name).to(self.dtype, device)
+        self.siglip = SiglipVisionModel.from_pretrained(siglip_name).to(device, self.dtype)
+        self.siglip_normalize = SiglipImageProcessor.from_pretrained(siglip_name)
 
     # Copied from diffusers.pipelines.cogvideo.pipeline_cogvideox.CogVideoXPipeline._prepare_rotary_positional_embeddings
     @torch.no_grad()
@@ -149,7 +150,7 @@ class SkyReelsA1V2VInpaintPipeline:
             pixel_mask = pixel_mask.to(self.device)
             latent_mask = latent_mask.to(self.device)
             
-            clean_latent = self.vae.encode(ref_video).latent_dist.sample()
+            clean_latent = self.vae.encode(ref_video.unsqueeze(1)).latent_dist.sample()[0]
             noise = torch.randn_like(clean_latent, device=ref_video.device, dtype=self.dtype)
             noisy_latent = self.scheduler.add_noise(
                 clean_latent, 
@@ -161,9 +162,9 @@ class SkyReelsA1V2VInpaintPipeline:
             # Mask the reference video by the pixel mask, except the first frame.
             pixel_mask = pixel_mask[:, 1:, :, :]
             ref_video[:, 1:, : :] *= pixel_mask
-            ref_latent = self.vae.encode(ref_video)[0].mode()
+            ref_latent = self.vae.encode(ref_video).latent_dist.mode()[0]
 
-            lmk_latent = self.lmk_encoder.encode(driving_video)[0].mode()
+            lmk_latent = self.lmk_encoder.encode(driving_video).latent_dist.mode()[0]
             lmk_latent = lmk_latent * self.lmk_encoder.config.scaling_factor
 
             # concatenate along channel dimension.
@@ -191,7 +192,7 @@ class SkyReelsA1V2VInpaintPipeline:
         
         all_image_embeddings = []
         for identity_image in identity_images:
-            image = identity_image.to(self.dtype, self.device)
+            image = identity_image.to(self.device, self.dtype)
             imgs = self.siglip_normalize.preprocess(images=[image], do_resize=True, return_tensors="pt", do_convert_rgb=True)
             image_embeddings = self.siglip(**imgs.to(dtype=self.dtype)).last_hidden_state # torch.Size([1, 729, 1152])
             all_image_embeddings.append(image_embeddings)

@@ -22,8 +22,12 @@ def expand_mask(mask, expand_x, expand_y):
 
     if expand_x <= 0 and expand_y <= 0:
         return mask
+    
+    # rearrange mask to (T, 1, H, W)
+    mask = mask.permute(1, 0, 2, 3)
 
     # Create a kernel for dilation
+    # (out_channels, in_channels/groups, kernel_height, kernel_width)
     kernel = torch.ones((1, 1, expand_y * 2 + 1, expand_x * 2 + 1), device=mask.device)
 
     # Use dilation to expand the mask
@@ -31,6 +35,9 @@ def expand_mask(mask, expand_x, expand_y):
     
     # Threshold the result to create a binary mask
     expanded_mask = (expanded_mask > 0).float()
+
+    # rearrange back to (1, T, H, W)
+    expanded_mask = expanded_mask.permute(1, 0, 2, 3)
 
     return expanded_mask
 
@@ -68,9 +75,16 @@ class Trainer:
         world_size = self.accelerator.num_processes
         rank = self.accelerator.process_index
         seed = self.accelerator.state.seed if hasattr(self.accelerator.state, "seed") else 42
-        self.dataloader = get_dataloader(config.data_dir, config, world_size=world_size, rank=rank, seed=seed)
+        self.dataloader = get_dataloader(
+            config.data_dir, 
+            config, 
+            device=self.accelerator.device, 
+            world_size=world_size, 
+            rank=rank, 
+            seed=seed,
+        )
         self.wandb_enabled = config.get("wandb_enabled", False)
-        if self.wandb_enabled:
+        if self.wandb_enabled and self.accelerator.is_main_process:
             wandb.init(
                 project=config.get("wandb_project", "skyreels-a1-v2v"),
                 name=config.get("wandb_name", None),
@@ -86,7 +100,12 @@ class Trainer:
         if lora_rank is not None:
             print(f"Training LoRA (rank={lora_rank})")
             use_rslora = config.get("use_rslora", False)
-            lora_config = LoraConfig(r=lora_rank, use_rslora=use_rslora, target_modules=".*") 
+
+            target_modules = []
+            for name, module in self.pipeline.transformer.named_modules():
+                if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                    target_modules.append(name)
+            lora_config = LoraConfig(r=lora_rank, use_rslora=use_rslora, target_modules=target_modules) 
             self.pipeline.transformer = get_peft_model(self.pipeline.transformer, lora_config)
         else:
             print("Training without LoRA")
@@ -114,7 +133,15 @@ class Trainer:
         self.validation_data_dir = config.get("validation_data_dir", None)
         self.validation_dataloader = None
         if self.validation_data_dir:
-            self.validation_dataloader = get_dataloader(self.validation_data_dir, config, mode="val", world_size=world_size, rank=rank, seed=seed)
+            self.validation_dataloader = get_dataloader(
+                self.validation_data_dir, 
+                config, 
+                self.accelerator.device, 
+                mode="val", 
+                world_size=world_size, 
+                rank=rank, 
+                seed=seed,
+            )
 
         # Gradient accumulation setup
         self.gradient_accumulation_steps = config.get("gradient_accumulation_steps", 1)

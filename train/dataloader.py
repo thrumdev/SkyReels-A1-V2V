@@ -66,9 +66,10 @@ class BucketBatchSampler(Sampler):
 
 
 class SkyReelsV2VDataset(Dataset):
-    def __init__(self, data_dir):
+    def __init__(self, data_dir, device):
         self.data_dir = data_dir
         self.manifest = load_manifest(data_dir)
+        self.device = device
 
     def __len__(self):
         return len(self.manifest)
@@ -77,8 +78,8 @@ class SkyReelsV2VDataset(Dataset):
         # Load video using decord, expects FFV1 .avi files
         vr = VideoReader(path)
         frames = vr.get_batch(range(len(vr))).asnumpy() # (T, H, W, C)
-        frames = torch.tensor(frames.permute(3, 0, 1, 2)).float() / 255.0 # (C, T, H, W)
-        return frames
+        frames = torch.from_numpy(frames).float().permute(3, 0, 1, 2) / 255.0  # (C, T, H, W)
+        return frames.to(self.device)
 
     def __getitem__(self, idx):
         """
@@ -102,8 +103,8 @@ class SkyReelsV2VDataset(Dataset):
         identity_path = os.path.join(self.data_dir, f"{video_id}_identity.png")
         driving_video = self.load_video_tensor(driving_path)
         original_video = self.load_video_tensor(original_path)
-        pixel_mask = self.load_video_tensor(mask_path)
-        flow_mask = self.load_video_tensor(flow_mask_path)
+        pixel_mask = self.load_video_tensor(mask_path)[0, :, :, :].unsqueeze(0)  # (1, T, H, W)
+        flow_mask = self.load_video_tensor(flow_mask_path)[0, :, :, :].unsqueeze(0)  # (1, T, H, W)
         identity_image = cv2.imread(identity_path)
         identity_image = cv2.cvtColor(identity_image, cv2.COLOR_BGR2RGB)
         identity_image = torch.tensor(identity_image).permute(2, 0, 1)  # (C, H, W)
@@ -115,10 +116,20 @@ class SkyReelsV2VDataset(Dataset):
             "cropped_aligned_identity": identity_image
         }
 
+def list_collate(batch):
+    # Returns a dict of lists for each key in the batch
+    collated = {}
+    for key in batch[0].keys():
+        collated[key] = [item[key] for item in batch]
+    return collated
 
-def get_dataloader(data_dir, config, mode="train", world_size=1, rank=0, seed=42):
+def get_dataloader(data_dir, config, device, mode="train", world_size=1, rank=0, seed=42):
     """
     Returns a DataLoader for the given data_dir and config.
     """
-    dataset = SkyReelsV2VDataset(data_dir)
-    return DataLoader(dataset, batch_sampler=BucketBatchSampler(config, mode="mode", world_size=world_size, rank=rank, seed=seed))
+    dataset = SkyReelsV2VDataset(data_dir, device)
+    return DataLoader(
+        dataset,
+        batch_sampler=BucketBatchSampler(config, mode="mode", world_size=world_size, rank=rank, seed=seed),
+        collate_fn=list_collate
+    )

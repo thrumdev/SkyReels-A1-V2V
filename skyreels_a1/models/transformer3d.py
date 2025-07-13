@@ -101,7 +101,7 @@ class CogVideoXPatchEmbed(nn.Module):
         if new_in_channels <= old_in_channels:
             return  # No expansion needed
         
-        print("Expanding token embedding channels to 16")
+        print(f"Expanding token embedding channels to {new_in_channels}")
         new_conv = nn.Conv2d(
             new_in_channels,
             old_conv.out_channels,

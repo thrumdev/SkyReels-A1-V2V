@@ -3,6 +3,7 @@ from accelerate import Accelerator
 from peft import LoraConfig, get_peft_model
 import torch
 import os
+import time
 
 from .dataloader import get_dataloader
 from .pipeline import SkyReelsA1V2VInpaintPipeline
@@ -81,10 +82,17 @@ class Trainer:
         self.pipeline.transformer.requires_grad_(True)
 
         # LoRA PEFT setup
-        lora_rank = config.get("lora_rank", 32)
-        lora_config = LoraConfig(r=lora_rank, target_modules=None) 
-        self.pipeline.transformer = get_peft_model(self.pipeline.transformer, lora_config)
+        lora_rank = config.get("lora_rank")
+        if lora_rank is not None:
+            print(f"Training LoRA (rank={lora_rank})")
+            use_rslora = config.get("use_rslora", False)
+            lora_config = LoraConfig(r=lora_rank, use_rslora=use_rslora, target_modules=".*") 
+            self.pipeline.transformer = get_peft_model(self.pipeline.transformer, lora_config)
         self.pipeline.transformer.print_trainable_parameters()
+
+        if config.get("gradient_checkpointing", False):
+            print("Enabling gradient checkpointing")
+            self.pipeline.transformer._set_gradient_checkpointing(True)
 
         # Create optimizer out of all trained parameters.
         lora_params = filter(lambda p: p.requires_grad, self.pipeline.transformer.parameters())
@@ -165,6 +173,9 @@ class Trainer:
                         if avg_val_loss is not None and self.config.wandb_enabled and self.accelerator.is_main_process:
                             wandb.log({"step": step, "val_loss": avg_val_loss})
                     step += 1
+                    if step % 10 == 0 and self.accelerator.is_main_process:
+                        timestamp = time.strftime("%H:%M:%S")
+                        print(f"[{timestamp}] Step {step}/{max_steps}, Last loss: {loss:.4f}")
                     if step % save_frequency == 0:
                         self.save(step)
 

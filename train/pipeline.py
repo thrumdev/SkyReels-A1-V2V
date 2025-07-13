@@ -36,6 +36,7 @@ class SkyReelsA1V2VInpaintPipeline:
         model_name = config.get("model_path", "pretrained_models/SkyReels-A1-5B")
         siglip_name = config.get("siglip_path", "pretrained_models/SkyReels-A1-5B/siglip-so400m-patch14-384")
         self.dtype = config.get("dtype", "bfloat16")
+        self.device = device
 
         self.transformer = CogVideoXTransformer3DModel.from_pretrained(
             model_name,
@@ -140,18 +141,26 @@ class SkyReelsA1V2VInpaintPipeline:
 
         all_noise = []
         model_inputs = []
+
+        # ignore the first frame of the pixel mask.
         for ref_video, driving_video, pixel_mask, latent_mask, timestep, in zip(ref_videos, driving_videos, pixel_masks, latent_masks, timesteps):
+            ref_video = ref_video.to(self.device)
+            driving_video = driving_video.to(self.device)
+            pixel_mask = pixel_mask.to(self.device)
+            latent_mask = latent_mask.to(self.device)
+            
             clean_latent = self.vae.encode(ref_video).latent_dist.sample()
             noise = torch.randn_like(clean_latent, device=ref_video.device, dtype=self.dtype)
             noisy_latent = self.scheduler.add_noise(
                 clean_latent, 
                 noise, 
-                torch.tensor([timestep], dtype=torch.int64)
+                torch.tensor([timestep], dtype=torch.int64, device=self.device)
             )
             noisy_latent = self.scheduler.scale_model_input(noisy_latent, timestep)
             
             # Mask the reference video by the pixel mask, except the first frame.
-            ref_video = ref_video * pixel_mask[:, 0:1, :, :]
+            pixel_mask = pixel_mask[:, 1:, :, :]
+            ref_video[:, 1:, : :] *= pixel_mask
             ref_latent = self.vae.encode(ref_video)[0].mode()
 
             lmk_latent = self.lmk_encoder.encode(driving_video)[0].mode()
@@ -174,7 +183,7 @@ class SkyReelsA1V2VInpaintPipeline:
         Embeds each identity image using the Siglip model.
 
         Args:
-            ref_videos: List of reference video tensors (C, T, H, W) with values in [0, 255]
+            identity_images: List of reference video images (C, H, W) with values in [0, 255]
 
         Returns:
             A tensor of shape [B, 729, 1152] where B is the number of reference videos.
@@ -182,12 +191,12 @@ class SkyReelsA1V2VInpaintPipeline:
         
         all_image_embeddings = []
         for identity_image in identity_images:
-            image = identity_image.to(self.dtype)  # Take the first frame of the reference video
+            image = identity_image.to(self.dtype, self.device)
             imgs = self.siglip_normalize.preprocess(images=[image], do_resize=True, return_tensors="pt", do_convert_rgb=True)
             image_embeddings = self.siglip(**imgs.to(dtype=self.dtype)).last_hidden_state # torch.Size([1, 729, 1152])
             all_image_embeddings.append(image_embeddings)
 
-        return torch.cat(all_image_embeddings, dim=0)
+        return torch.cat(all_image_embeddings, dim=0).to(self.device)
 
 
     def step_forward_and_loss(
@@ -230,7 +239,7 @@ class SkyReelsA1V2VInpaintPipeline:
             height=height,
             width=width,
             num_frames=frames,
-            device=model_inputs.device,
+            device=self.device,
         )
 
         noise_pred = self.transformer(
@@ -242,7 +251,7 @@ class SkyReelsA1V2VInpaintPipeline:
         )[0]
         noise_pred = noise_pred.float()
 
-        latent_masks = self.flatten_latent_mask(latent_masks)
+        latent_masks = self.flatten_latent_mask(latent_masks).to(self.device)
         inpaint_loss = self.compute_inpaint_loss(noise_pred, noise_gt, latent_masks)
         optical_flow_loss = self.compute_masked_optical_flow_loss(
             noise_pred,
@@ -327,8 +336,8 @@ class SkyReelsA1V2VInpaintPipeline:
             # this is again a divergence from skyreels-a1, but i believe we will want at least
             # some training signal to reach the 'low-motion' face pixels.
             mask = torch.clamp(mask, min=0.1)
+            combined_mask = mask * latent_mask.float()
 
-        combined_mask = mask * latent_mask.float()
         loss = ((noise_pred.float() - noise_gt.float()) ** 2) * combined_mask
         denom = loss.numel()  # average over all latent pixels, as described in the doc comment
         return loss.sum() / denom

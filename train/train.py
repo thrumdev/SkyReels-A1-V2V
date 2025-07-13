@@ -63,7 +63,11 @@ class Trainer:
     def __init__(self, config):
         self.config = config
         self.accelerator = Accelerator()
-        self.dataloader = get_dataloader(config.data_dir, config)
+        # Pass distributed parameters to get_dataloader
+        world_size = self.accelerator.num_processes
+        rank = self.accelerator.process_index
+        seed = self.accelerator.state.seed if hasattr(self.accelerator.state, "seed") else 42
+        self.dataloader = get_dataloader(config.data_dir, config, world_size=world_size, rank=rank, seed=seed)
         self.wandb_enabled = config.get("wandb_enabled", False)
         if self.wandb_enabled:
             wandb.init(
@@ -82,8 +86,6 @@ class Trainer:
         self.pipeline.transformer = get_peft_model(self.pipeline.transformer, lora_config)
         self.pipeline.transformer.print_trainable_parameters()
 
-        # Prepare model and dataloader for distributed/accelerated training
-
         # Create optimizer out of all trained parameters.
         lora_params = filter(lambda p: p.requires_grad, self.pipeline.transformer.parameters())
         optimizer = torch.optim.AdamW(lora_params, lr=config.get("learning_rate", 1e-4))
@@ -96,7 +98,7 @@ class Trainer:
         self.validation_data_dir = config.get("validation_data_dir", None)
         self.validation_dataloader = None
         if self.validation_data_dir:
-            self.validation_dataloader = get_dataloader(self.validation_data_dir, config)
+            self.validation_dataloader = get_dataloader(self.validation_data_dir, config, world_size=world_size, rank=rank, seed=seed)
 
         # Gradient accumulation setup
         self.gradient_accumulation_steps = config.get("gradient_accumulation_steps", 1)

@@ -20,10 +20,14 @@ def load_manifest(data_dir_path):
         return json.load(f)
 
 class BucketBatchSampler(Sampler):
-    def __init__(self, config):
+    def __init__(self, config, world_size=1, rank=0, seed=42):
         self.config = config
         self.batch_size = config.get("batch_size", 1)
         self.manifest = load_manifest(config.data_dir)
+        self.world_size = world_size
+        self.rank = rank
+        self.seed = seed
+        self.epoch = 0  # For per-epoch shuffling
 
         self.resolution_buckets = {}
         for idx, item in enumerate(self.manifest):
@@ -33,16 +37,31 @@ class BucketBatchSampler(Sampler):
             self.resolution_buckets[resolution].append(idx)
 
     def __iter__(self):
+        # Bump epoch for each call to __iter__
+        self.epoch += 1
+        rng = random.Random(self.seed + self.epoch)
         batches = []
-        for resolution, indices in self.resolution_buckets.items():
-            random.shuffle(indices)
+
+        # Deterministic loop.
+        for resolution in sorted(self.resolution_buckets.keys()):
+            indices = self.resolution_buckets[resolution].copy()
+            rng.shuffle(indices)
             for i in range(0, len(indices), self.batch_size):
                 batch_indices = indices[i:i + self.batch_size]
                 if len(batch_indices) < self.batch_size:
                     continue
                 batches.append(batch_indices)
 
-        random.shuffle(batches)
+        rng.shuffle(batches)
+        # Shard batches for distributed training
+        total_batches = len(batches)
+        # Ensure all replicas yield the same number of batches
+        # Note this discards the remainder if total_batches is not divisible by world_size
+        # This should balance out across many epochs.
+        num_batches_per_replica = total_batches // self.world_size
+        start = self.rank * num_batches_per_replica
+        end = start + num_batches_per_replica
+        batches = batches[start:end]
         return iter(batches)
 
 
@@ -97,9 +116,9 @@ class SkyReelsV2VDataset(Dataset):
         }
 
 
-def get_dataloader(data_dir, config):
+def get_dataloader(data_dir, config, world_size=1, rank=0, seed=42):
     """
     Returns a DataLoader for the given data_dir and config.
     """
     dataset = SkyReelsV2VDataset(data_dir)
-    return DataLoader(dataset, batch_sampler=BucketBatchSampler(config))
+    return DataLoader(dataset, batch_sampler=BucketBatchSampler(config, world_size=world_size, rank=rank, seed=seed))

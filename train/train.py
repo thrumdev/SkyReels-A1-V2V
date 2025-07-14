@@ -72,16 +72,9 @@ class Trainer:
         self.config = config
         self.accelerator = Accelerator()
         # Pass distributed parameters to get_dataloader
-        world_size = self.accelerator.num_processes
-        rank = self.accelerator.process_index
-        seed = self.accelerator.state.seed if hasattr(self.accelerator.state, "seed") else 42
         self.dataloader = get_dataloader(
             config.data_dir, 
             config, 
-            device=self.accelerator.device, 
-            world_size=world_size, 
-            rank=rank, 
-            seed=seed,
         )
         self.wandb_enabled = config.get("wandb_enabled", False)
         if self.wandb_enabled and self.accelerator.is_main_process:
@@ -113,7 +106,8 @@ class Trainer:
 
         if config.get("gradient_checkpointing", False):
             print("Enabling gradient checkpointing")
-            self.pipeline.transformer._set_gradient_checkpointing(True)
+            # this take a module parameter (not used) and then value as a kwarg
+            self.pipeline.transformer._set_gradient_checkpointing("", value=True)
 
         for name, param in self.pipeline.transformer.named_parameters():
             if param.requires_grad and self.accelerator.is_main_process:
@@ -123,10 +117,12 @@ class Trainer:
         trained_params = filter(lambda p: p.requires_grad, self.pipeline.transformer.parameters())
         optimizer = torch.optim.AdamW(trained_params, lr=config.get("learning_rate", 1e-4))
 
-        #self.pipeline.transformer = torch.compile(self.pipeline.transformer)
+        if config.get("compile", False):
+            self.pipeline.transformer.compile_blocks()
 
         # Prepare model, dataloader, and optimizer for distributed/accelerated training
         self.pipeline.transformer, self.dataloader, self.optimizer = self.accelerator.prepare(self.pipeline.transformer, self.dataloader, optimizer)
+        self.pipeline.transformer.__dict__["_orig_mod"] = "" # workaround for partial compilation
 
         # Validation dataloader
         self.validation_steps = config.get("validation_steps", 1000)
@@ -136,11 +132,7 @@ class Trainer:
             self.validation_dataloader = get_dataloader(
                 self.validation_data_dir, 
                 config, 
-                self.accelerator.device, 
                 mode="val", 
-                world_size=world_size, 
-                rank=rank, 
-                seed=seed,
             )
 
         # Gradient accumulation setup
@@ -155,6 +147,17 @@ class Trainer:
         masks = list(batch["mask"])
         optical_flow_masks = list(batch["optical_flow_mask"])
         identity_images = list(batch["cropped_aligned_identity"])
+
+        def to_device(list, dtype=None):
+            if dtype is None:
+                dtype = self.pipeline.dtype
+            return [x.to(self.accelerator.device, dtype) for x in list]
+
+        ref_videos = to_device(ref_videos)
+        driving_videos = to_device(driving_videos)
+        masks = to_device(masks)
+        optical_flow_masks = to_device(optical_flow_masks)
+        identity_images = to_device(identity_images, dtype=torch.float32)
 
         frames = 49
 
@@ -218,7 +221,13 @@ class Trainer:
         save_dir = os.path.join(self.config.get("save_dir", "checkpoints"), f"model_step_{step}")
         os.makedirs(save_dir, exist_ok=True)
         model = self.accelerator.unwrap_model(self.pipeline.transformer)
-        model.save_pretrained(save_dir)
+
+        if self.config.get("lora_rank") is not None:
+            # If using LoRA, save only the adapter weights
+            model.save_pretrained(save_dir, save_adapter=True)
+        else:
+            model.save_pretrained(save_dir)
+
         # Remove older checkpoints, keep only last max_checkpoints
         max_checkpoints = self.config.get("max_checkpoints", 5)
         parent_dir = self.config.get("save_dir", "checkpoints")

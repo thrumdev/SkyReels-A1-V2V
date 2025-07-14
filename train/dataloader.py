@@ -19,57 +19,10 @@ def load_manifest(data_dir_path, mode="train"):
     with open(manifest_path, "r") as f:
         return json.load(f)
 
-class BucketBatchSampler(Sampler):
-    def __init__(self, config, mode="train", world_size=1, rank=0, seed=42):
-        self.config = config
-        self.batch_size = config.get("batch_size", 1)
-        self.manifest = load_manifest(config.data_dir)
-        self.world_size = world_size
-        self.rank = rank
-        self.seed = seed
-        self.epoch = 0  # For per-epoch shuffling
-
-        self.resolution_buckets = {}
-        for idx, item in enumerate(self.manifest):
-            resolution = item.get("resolution", "unknown")
-            if resolution not in self.resolution_buckets:
-                self.resolution_buckets[resolution] = []
-            self.resolution_buckets[resolution].append(idx)
-
-    def __iter__(self):
-        # Bump epoch for each call to __iter__
-        self.epoch += 1
-        rng = random.Random(self.seed + self.epoch)
-        batches = []
-
-        # Deterministic loop.
-        for resolution in sorted(self.resolution_buckets.keys()):
-            indices = self.resolution_buckets[resolution].copy()
-            rng.shuffle(indices)
-            for i in range(0, len(indices), self.batch_size):
-                batch_indices = indices[i:i + self.batch_size]
-                if len(batch_indices) < self.batch_size:
-                    continue
-                batches.append(batch_indices)
-
-        rng.shuffle(batches)
-        # Shard batches for distributed training
-        total_batches = len(batches)
-        # Ensure all replicas yield the same number of batches
-        # Note this discards the remainder if total_batches is not divisible by world_size
-        # This should balance out across many epochs.
-        num_batches_per_replica = total_batches // self.world_size
-        start = self.rank * num_batches_per_replica
-        end = start + num_batches_per_replica
-        batches = batches[start:end]
-        return iter(batches)
-
-
 class SkyReelsV2VDataset(Dataset):
-    def __init__(self, data_dir, device):
+    def __init__(self, data_dir, mode="train"):
         self.data_dir = data_dir
-        self.manifest = load_manifest(data_dir)
-        self.device = device
+        self.manifest = load_manifest(data_dir, mode)
 
     def __len__(self):
         return len(self.manifest)
@@ -87,7 +40,7 @@ class SkyReelsV2VDataset(Dataset):
             crop_t = (height - crop_height) // 2
             frames = frames[:, :, crop_t:crop_t + crop_height, :]
 
-        return frames.to(self.device)
+        return frames
 
     def __getitem__(self, idx):
         """
@@ -131,13 +84,15 @@ def list_collate(batch):
         collated[key] = [item[key] for item in batch]
     return collated
 
-def get_dataloader(data_dir, config, device, mode="train", world_size=1, rank=0, seed=42):
+def get_dataloader(data_dir, config, mode="train"):
     """
     Returns a DataLoader for the given data_dir and config.
     """
-    dataset = SkyReelsV2VDataset(data_dir, device)
+    dataset = SkyReelsV2VDataset(data_dir, mode)
     return DataLoader(
         dataset,
-        batch_sampler=BucketBatchSampler(config, mode="mode", world_size=world_size, rank=rank, seed=seed),
+        batch_size=config.batch_size,
+        num_workers=8,
+        prefetch_factor=1,
         collate_fn=list_collate
     )

@@ -61,6 +61,10 @@ class SkyReelsA1V2VInpaintPipeline:
             subfolder="scheduler"
         )
 
+        if config.get("compile", False):
+            self.vae.encode = torch.compile(self.vae.encode)
+            self.lmk_encoder.encode = torch.compile(self.lmk_encoder.encode)
+
         self.siglip = SiglipVisionModel.from_pretrained(siglip_name).to(device, self.dtype)
         self.siglip_normalize = SiglipImageProcessor.from_pretrained(siglip_name)
         self.t_config = self.transformer.config
@@ -74,18 +78,18 @@ class SkyReelsA1V2VInpaintPipeline:
         num_frames: int,
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        p = self.t_config.patch_size
+        p = self.transformer.config.patch_size
         vae_scale_factor_spatial = 8
         grid_height = height // (vae_scale_factor_spatial * p)
         grid_width = width // (vae_scale_factor_spatial * p)
+        base_size_width = self.transformer.config.sample_width // p
+        base_size_height = self.transformer.config.sample_height // p
 
-        grid_crops_coords = (
-            (0, 0),
-            grid_height,
-            grid_width,
+        grid_crops_coords = get_resize_crop_region_for_grid(
+            (grid_height, grid_width), base_size_width, base_size_height
         )
         freqs_cos, freqs_sin = get_3d_rotary_pos_embed(
-            embed_dim=self.t_config.attention_head_dim,
+            embed_dim=self.transformer.config.attention_head_dim,
             crops_coords=grid_crops_coords,
             grid_size=(grid_height, grid_width),
             temporal_size=num_frames,
@@ -141,43 +145,34 @@ class SkyReelsA1V2VInpaintPipeline:
             [noisy_latent, lmk_latent, ref_latent, latent_mask]
         """
 
-        all_noise = []
-        model_inputs = []
+        ref_videos = torch.stack(ref_videos, dim=0).to(self.device, self.dtype) # (B, C, T, H, W)
+        driving_videos = torch.stack(driving_videos, dim=0).to(self.device, self.dtype)  # (B, C, T, H, W)
+        pixel_masks = torch.stack(pixel_masks, dim=0).to(self.device, self.dtype)  # (B, 1, T, H, W)
+        latent_masks = torch.stack(latent_masks, dim=0).to(self.device, self.dtype)  # (B, 64, T', H', W')
 
-        # ignore the first frame of the pixel mask.
-        for ref_video, driving_video, pixel_mask, latent_mask, timestep, in zip(ref_videos, driving_videos, pixel_masks, latent_masks, timesteps):
-            ref_video = ref_video.to(self.device, self.dtype)
-            driving_video = driving_video.to(self.device, self.dtype)
-            pixel_mask = pixel_mask.to(self.device, self.dtype)
-            latent_mask = latent_mask.to(self.device, self.dtype)
-            
-            clean_latent = self.vae.encode(ref_video.unsqueeze(0)).latent_dist.sample()[0]
-            noise = torch.randn_like(clean_latent, device=ref_video.device, dtype=self.dtype)
-            noisy_latent = self.scheduler.add_noise(
-                clean_latent, 
-                noise, 
-                torch.tensor([timestep], dtype=torch.int64, device=self.device)
-            )
-            noisy_latent = self.scheduler.scale_model_input(noisy_latent, timestep)
-            
-            # Mask the reference video by the pixel mask, except the first frame.
-            pixel_mask = pixel_mask[:, 1:, :, :]
-            ref_video[:, 1:, : :] *= pixel_mask
-            ref_latent = self.vae.encode(ref_video.unsqueeze(0)).latent_dist.mode()[0]
+        clean_latent = self.vae.encode(ref_videos).latent_dist.sample()  # (B, C, T', H', W_)
+        noise = torch.randn_like(clean_latent, device=ref_videos.device, dtype=self.dtype)
+        noisy_latent = self.scheduler.add_noise(
+            clean_latent, 
+            noise, 
+            torch.tensor(timesteps, dtype=torch.int64, device=self.device)
+        )
 
-            lmk_latent = self.lmk_encoder.encode(driving_video.unsqueeze(0)).latent_dist.mode()[0]
-            lmk_latent = lmk_latent * self.lmk_encoder.config.scaling_factor
+        # note: this is a no-op anyway with this scheduler, but would require looping for this impl
+        # so we skip it
+        # noisy_latent = self.scheduler.scale_model_input(noisy_latent, timesteps)
 
-            # concatenate along channel dimension.
-            model_input = torch.cat([noisy_latent, lmk_latent, ref_latent, latent_mask], dim=0)
-            model_inputs.append(model_input)
-            all_noise.append(noise)
+        # Mask the reference video by the pixel mask, except the first frame.
+        pixel_mask = pixel_masks[:, :, 1:, :, :]
+        ref_videos[:, :, 1:, :, :] *= pixel_mask
+        ref_latent = self.vae.encode(ref_videos).latent_dist.mode() 
 
-        # Stack all model inputs and noise tensors along a freshly introduced batch dimension.
-        model_inputs = torch.stack(model_inputs, dim=0)
-        all_noise = torch.stack(all_noise, dim=0)
+        lmk_latent = self.lmk_encoder.encode(driving_videos).latent_dist.mode()
 
-        return model_inputs, all_noise
+        # concatenate along channel dimension (B, C, T', H', W')
+        model_input = torch.cat([noisy_latent, lmk_latent, ref_latent, latent_masks], dim=1)
+
+        return model_input, noise
 
     @torch.no_grad()
     def embed_reference_prompt(self, identity_images):
@@ -191,14 +186,11 @@ class SkyReelsA1V2VInpaintPipeline:
             A tensor of shape [B, 729, 1152] where B is the number of reference videos.
         """
         
-        all_image_embeddings = []
-        for identity_image in identity_images:
-            image = identity_image.to(self.device, torch.float32)
-            imgs = self.siglip_normalize.preprocess(images=[image], do_resize=True, return_tensors="pt", do_convert_rgb=True)
-            image_embeddings = self.siglip(**imgs.to(self.device, self.dtype)).last_hidden_state # torch.Size([1, 729, 1152])
-            all_image_embeddings.append(image_embeddings)
+        imgs = self.siglip_normalize.preprocess(images=identity_images, do_resize=True, return_tensors="pt", do_convert_rgb=True)
+        imgs = imgs.to(self.device, self.dtype)
+        image_embeddings = self.siglip(**imgs).last_hidden_state  # torch.Size([B, 729, 1152])
 
-        return torch.cat(all_image_embeddings, dim=0).to(self.device, self.dtype)
+        return image_embeddings.to(self.device, self.dtype)
 
 
     def step_forward_and_loss(
@@ -253,6 +245,8 @@ class SkyReelsA1V2VInpaintPipeline:
             return_dict=False,
         )[0]
 
+        noise_pred = noise_pred.permute(0, 2, 1, 3, 4)  # Swap channels/frames back
+
         noise_pred = noise_pred.float()
         noise_gt = noise_gt.float()
         latent_masks = self.flatten_latent_mask(latent_masks).to(self.device)
@@ -281,7 +275,7 @@ class SkyReelsA1V2VInpaintPipeline:
         """
 
         latent_mask = torch.stack(latent_masks, dim=0)
-        return latent_mask.mean(dim=1, keep_dim=True)
+        return latent_mask.mean(dim=1, keepdim=True)
     
     def compute_inpaint_loss(self, noise_pred, noise_gt, latent_mask):
         """

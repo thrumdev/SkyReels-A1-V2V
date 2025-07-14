@@ -23,3 +23,4 @@ validation_data_dir: 'data/val'
 max_checkpoints: 5
 #gradient_checkpointing: true
 gradient_accumulation_steps: 4
+compile: false

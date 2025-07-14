@@ -123,7 +123,7 @@ class Trainer:
         trained_params = filter(lambda p: p.requires_grad, self.pipeline.transformer.parameters())
         optimizer = torch.optim.AdamW(trained_params, lr=config.get("learning_rate", 1e-4))
 
-        self.pipeline.transformer = torch.compile(self.pipeline.transformer)
+        #self.pipeline.transformer = torch.compile(self.pipeline.transformer)
 
         # Prepare model, dataloader, and optimizer for distributed/accelerated training
         self.pipeline.transformer, self.dataloader, self.optimizer = self.accelerator.prepare(self.pipeline.transformer, self.dataloader, optimizer)
@@ -211,25 +211,28 @@ class Trainer:
                     if step % 10 == 0 and self.accelerator.is_main_process:
                         timestamp = time.strftime("%H:%M:%S")
                         print(f"[{timestamp}] Step {step}/{max_steps}, Last loss: {loss:.4f}")
-                    if step % save_frequency == 0:
+                    if step % save_frequency == 0 and self.accelerator.is_main_process:
                         self.save(step)
 
     def save(self, step):
-        save_dir = self.config.get("save_dir", "checkpoints")
+        save_dir = os.path.join(self.config.get("save_dir", "checkpoints"), f"model_step_{step}")
         os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, f"model_step_{step}.pt")
-        torch.save(self.pipeline.transformer.state_dict(), save_path)
-        print(f"Model saved to {save_path}")
+        model = self.accelerator.unwrap_model(self.pipeline.transformer)
+        model.save_pretrained(save_dir)
         # Remove older checkpoints, keep only last max_checkpoints
         max_checkpoints = self.config.get("max_checkpoints", 5)
-        ckpts = sorted([f for f in os.listdir(save_dir) if f.startswith("model_step_") and f.endswith(".pt")],
-                      key=lambda x: int(x.split("_step_")[1].split(".pt")[0]))
-        if len(ckpts) > max_checkpoints:
-            for old_ckpt in ckpts[:-max_checkpoints]:
-                old_ckpt_path = os.path.join(save_dir, old_ckpt)
+        parent_dir = self.config.get("save_dir", "checkpoints")
+        # List all checkpoint directories matching model_step_*
+        ckpt_dirs = [d for d in os.listdir(parent_dir) if d.startswith("model_step_") and os.path.isdir(os.path.join(parent_dir, d))]
+        ckpt_dirs = sorted(ckpt_dirs, key=lambda x: int(x.split("_step_")[1]))
+        if len(ckpt_dirs) > max_checkpoints:
+            for old_ckpt in ckpt_dirs[:-max_checkpoints]:
+                old_ckpt_path = os.path.join(parent_dir, old_ckpt)
                 try:
-                    os.remove(old_ckpt_path)
-                    print(f"Removed old checkpoint: {old_ckpt_path}")
+                    # Remove the entire directory and its contents
+                    import shutil
+                    shutil.rmtree(old_ckpt_path)
+                    print(f"Removed old checkpoint directory: {old_ckpt_path}")
                 except Exception as e:
                     print(f"Error removing {old_ckpt_path}: {e}")
 

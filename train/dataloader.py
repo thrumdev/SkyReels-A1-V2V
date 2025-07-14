@@ -79,6 +79,14 @@ class SkyReelsV2VDataset(Dataset):
         vr = VideoReader(path)
         frames = vr.get_batch(range(len(vr))).asnumpy() # (T, H, W, C)
         frames = torch.from_numpy(frames).float().permute(3, 0, 1, 2) / 255.0  # (C, T, H, W)
+
+        # Crop to 480 height
+        if frames.shape[2] > 480:
+            height = frames.shape[2]
+            crop_height = 480
+            crop_t = (height - crop_height) // 2
+            frames = frames[:, :, crop_t:crop_t + crop_height, :]
+
         return frames.to(self.device)
 
     def __getitem__(self, idx):

@@ -251,9 +251,9 @@ class SkyReelsA1V2VInpaintPipeline:
         # so we skip it
         # noisy_latent = self.scheduler.scale_model_input(noisy_latent, timesteps)
 
-        # Mask the reference video by the pixel mask, except the first frame.
+        # Cut out all pixels in the mask from the reference.
         pixel_mask = pixel_masks[:, :, 1:, :, :]
-        ref_videos[:, :, 1:, :, :] *= pixel_mask
+        ref_videos[:, :, 1:, :, :] *= (1.0 - pixel_mask)
         ref_latent = self.vae.encode(ref_videos).latent_dist.mode() * self.vae_scaling_factor_image
 
         lmk_latent = self.lmk_encoder.encode(driving_videos).latent_dist.mode()

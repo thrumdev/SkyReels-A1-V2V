@@ -249,12 +249,14 @@ class Trainer:
         self.optimizer.zero_grad()
 
         self.init_pbar()
+        batch_loss = 0
+
         while True:
             for batch in self.dataloader:
                 if step >= max_steps:
                     print(f"Reached maximum training steps: {max_steps}. Stopping training.")
                     return max_steps
-                loss = self.train_one_step(batch)
+                batch_loss += self.train_one_step(batch)
                 self._step_in_accum += 1
                 self.step_pbar()
                 if self._step_in_accum % self.gradient_accumulation_steps == 0:
@@ -269,16 +271,18 @@ class Trainer:
                         avg_val_loss = self.validate(step)
 
                     if self.config.wandb_enabled and self.accelerator.is_main_process:
-                        wandb.log({"step": step, "loss": loss, "val_loss": avg_val_loss, "grad_norm": grad_norm})
+                        wandb.log({"step": step, "loss": batch_loss, "val_loss": avg_val_loss, "grad_norm": grad_norm})
 
                     step += 1
                     self.init_pbar()
 
                     if self.accelerator.is_main_process:
                         timestamp = time.strftime("%H:%M:%S")
-                        print(f"[{timestamp}] Step {step}/{max_steps}, Last loss: {loss:.4f}")
+                        print(f"[{timestamp}] Step {step}/{max_steps}, Last loss: {batch_loss:.4f}")
                     if step % save_frequency == 0 and self.accelerator.is_main_process:
                         self.save(step)
+
+                    batch_loss = 0
 
     def gradient_norm(self):
         """

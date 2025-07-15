@@ -185,7 +185,6 @@ class Trainer:
             timesteps,
             height,
             width,
-            frames
         )
         loss = loss / self.gradient_accumulation_steps
         self.accelerator.backward(loss)

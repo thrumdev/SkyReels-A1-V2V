@@ -92,7 +92,7 @@ def get_dataloader(data_dir, config, mode="train"):
     num_workers = config.get("dataloader_workers", 5)
     if mode == "train":
         batch_size = config.batch_size
-    else if mode == "val":
+    elif mode == "val":
         batch_size = config.get("val_batch_size", config.batch_size)    
     return DataLoader(
         dataset,

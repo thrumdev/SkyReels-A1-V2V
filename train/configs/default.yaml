@@ -22,7 +22,10 @@ max_mask_expand: 10
 validation_steps: 1000
 validation_data_dir: 'data/val'
 max_checkpoints: 5
+dataloader_workers: 5
 #gradient_checkpointing: true
 gradient_accumulation_steps: 4
 compile: false
 logit_normal_blend: 0.6
+#restore_checkpoint: /path/to/checkpoint
+#start_step: 0

@@ -1,6 +1,6 @@
 from omegaconf import OmegaConf
 from accelerate import Accelerator
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 import torch
 import os
 import time
@@ -107,6 +107,8 @@ class Trainer:
 
         # LoRA PEFT setup
         lora_rank = config.get("lora_rank")
+        restore_checkpoint = config.get("restore_checkpoint")
+
         if lora_rank is not None:
             print(f"Training LoRA (rank={lora_rank})")
             use_rslora = config.get("use_rslora", False)
@@ -115,8 +117,16 @@ class Trainer:
             for name, module in self.pipeline.transformer.named_modules():
                 if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
                     target_modules.append(name)
-            lora_config = LoraConfig(r=lora_rank, use_rslora=use_rslora, target_modules=target_modules) 
-            self.pipeline.transformer = get_peft_model(self.pipeline.transformer, lora_config)
+
+            if restore_checkpoint is None:
+                lora_config = LoraConfig(r=lora_rank, use_rslora=use_rslora, target_modules=target_modules) 
+                self.pipeline.transformer = get_peft_model(self.pipeline.transformer, lora_config)
+            else:
+                print("Restoring saved LoRa")
+                self.pipeline.transformer = PeftModel.from_pretrained(
+                    self.pipeline.transformer,
+                    is_trainable=True,
+                )
         else:
             print("Training without LoRA")
             self.pipeline.transformer.requires_grad_(True)
@@ -132,7 +142,15 @@ class Trainer:
 
         # Create optimizer out of all trained parameters.
         trained_params = filter(lambda p: p.requires_grad, self.pipeline.transformer.parameters())
-        optimizer = torch.optim.AdamW(trained_params, lr=config.get("learning_rate", 1e-4))
+
+        lr = config.get("learning_rate", 1e-4)
+        optimizer = torch.optim.AdamW(trained_params, lr=lr)
+
+        if restore_checkpoint is not None:
+            print("restoring optimizer state")
+            optimizer_path = os.path.join(restore_checkpoint, "optimizer.pt")
+            optimizer_state = torch.load(optimizer_path)
+            optimizer.load_state_dict(optimizer_state)
 
         if config.get("compile", False):
             self.pipeline.transformer.compile_blocks()

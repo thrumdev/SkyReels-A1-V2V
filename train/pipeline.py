@@ -9,6 +9,7 @@ from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 from einops import rearrange
 
 from typing import Tuple
+import inspect
 
 from skyreels_a1.models.transformer3d import CogVideoXTransformer3DModel
 
@@ -98,10 +99,20 @@ class SkyReelsA1V2VInpaintPipeline:
         self.dtype = getattr(torch, config.get("dtype", "bfloat16"))
         self.device = device
 
-        self.transformer = CogVideoXTransformer3DModel.from_pretrained(
-            model_name,
-            subfolder="transformer",
-        ).to(device, self.dtype)
+        restore_checkpoint = config.get("restore_checkpoint", None)
+
+        # We restore the full model only if no lora rank is specified.
+        if restore_checkpoint is None or config.get("lora_rank") is None:
+            self.transformer = CogVideoXTransformer3DModel.from_pretrained(
+                model_name,
+                subfolder="transformer",
+            ).to(device, self.dtype)
+        else:
+            print("Restoring full model")
+
+            self.transformer = CogVideoXTransformer3DModel.from_pretrained(
+                restore_checkpoint,
+            ).to(device, self.dtype)
 
         self.transformer.patch_embed.expand_proj_channels(48 + 64) # Add the mask channels if necessary.
 

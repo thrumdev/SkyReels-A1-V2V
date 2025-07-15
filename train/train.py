@@ -224,10 +224,14 @@ class Trainer:
                 self._step_in_accum += 1
                 if self._step_in_accum % self.gradient_accumulation_steps == 0:
                     self.optimizer.step()
-                    self.optimizer.zero_grad()
                     # Only log to wandb on the main process
                     if self.config.wandb_enabled and self.accelerator.is_main_process:
-                        wandb.log({"step": step, "loss": loss})
+                        grad_norm = self.gradient_norm()
+
+                        wandb.log({"step": step, "loss": loss, "grad_norm": grad_norm})
+
+                    self.optimizer.zero_grad()
+
                     # Validation
                     if self.validation_steps and self.validation_steps > 0 and step % self.validation_steps == 0:
                         avg_val_loss = self.validate(step)
@@ -240,6 +244,20 @@ class Trainer:
                     if step % save_frequency == 0 and self.accelerator.is_main_process:
                         self.save(step)
 
+    def gradient_norm(self):
+        """
+        Computes the gradient norm of the model parameters.
+        Returns:
+            float: The gradient norm.
+        """
+        total_norm = 0.0
+        model = self.accelerator.unwrap_model(self.pipeline.transformer)
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        return total_norm ** 0.5
+    
     def save(self, step):
         save_dir = os.path.join(self.config.get("save_dir", "checkpoints"), f"model_step_{step}")
         os.makedirs(save_dir, exist_ok=True)

@@ -156,8 +156,7 @@ class Trainer:
         self.gradient_accumulation_steps = config.get("gradient_accumulation_steps", 1)
         self._step_in_accum = 0
 
-    def train_one_step(self, batch):
-
+    def batch_to_device(self, batch):
         # Pipeline expects lists of tensors, not batched tensors
         ref_videos = list(batch["ref_video"])
         driving_videos = list(batch["driving_video"])
@@ -176,6 +175,10 @@ class Trainer:
         optical_flow_masks = to_device(optical_flow_masks)
         identity_images = to_device(identity_images, dtype=torch.float32)
 
+        return ref_videos, driving_videos, masks, optical_flow_masks, identity_images
+
+    def train_one_step(self, batch):
+        ref_videos, driving_videos, masks, optical_flow_masks, identity_images = self.batch_to_device(batch)
         frames = 49
 
         # The dataloader ensures that all the batch items have the same shape.
@@ -226,7 +229,7 @@ class Trainer:
                     if self.config.wandb_enabled and self.accelerator.is_main_process:
                         wandb.log({"step": step, "loss": loss})
                     # Validation
-                    if self.validation_steps and self.validation_steps > 0 and step % self.validation_steps == 0 and step > 0:
+                    if self.validation_steps and self.validation_steps > 0 and step % self.validation_steps == 0:
                         avg_val_loss = self.validate(step)
                         if avg_val_loss is not None and self.config.wandb_enabled and self.accelerator.is_main_process:
                             wandb.log({"step": step, "val_loss": avg_val_loss})
@@ -277,11 +280,7 @@ class Trainer:
         first_item = None
         with torch.no_grad():
             for batch in self.validation_dataloader:
-                ref_videos = list(batch["ref_video"])
-                driving_videos = list(batch["driving_video"])
-                masks = list(batch["mask"])
-                optical_flow_masks = list(batch["optical_flow_mask"])
-                identity_images = list(batch["cropped_aligned_identity"])
+                ref_videos, driving_videos, masks, optical_flow_masks, identity_images = self.batch_to_device(batch)
                 frames = 49
                 height, width = ref_videos[0].shape[2], ref_videos[0].shape[3]
                 # Shared trimming/pruning
@@ -314,10 +313,7 @@ class Trainer:
         gathered = gathered.cpu().numpy().tolist()
         avg_val_loss = sum(gathered) / len(gathered) if gathered else None
 
-        try:
-            self.save_full_inference_example(step, first_item)
-        except Exception as e:
-            print(f"Error saving full inference example: {e}")
+        self.save_full_inference_example(step, first_item)
 
         self.pipeline.transformer.train()
 
@@ -338,7 +334,7 @@ class Trainer:
             [item["identity_image"]],
             height,
             width,
-        ).squeeze(0)
+        ).squeeze(0).to(self.accelerator.device)
 
         mask_grayscale = item["mask"].repeat(3, 1, 1, 1)  # Convert mask to 3-channel grayscale
 

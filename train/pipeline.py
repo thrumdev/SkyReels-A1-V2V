@@ -411,7 +411,7 @@ class SkyReelsA1V2VInpaintPipeline:
 
             # update the noisy latents, leave the rest of the model inputs untouched.
             latents = model_inputs[:batch_size, :, 0:16, :, :].float()
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            latents = self.inference_scheduler.step(noise_pred, t, latents, return_dict=False)[0]
             latents = torch.cat([latents, latents], dim=0).to(model_inputs.dtype)
             model_inputs[:, :, 0:16, :, :] = latents
 

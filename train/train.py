@@ -314,7 +314,11 @@ class Trainer:
         gathered = gathered.cpu().numpy().tolist()
         avg_val_loss = sum(gathered) / len(gathered) if gathered else None
 
-        self.save_full_inference_example(step, first_item)
+        try:
+            self.save_full_inference_example(step, first_item)
+        except Exception as e:
+            print(f"Error saving full inference example: {e}")
+            
         self.pipeline.transformer.train()
 
         return avg_val_loss

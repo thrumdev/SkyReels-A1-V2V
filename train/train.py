@@ -6,6 +6,7 @@ import os
 import time
 import cv2
 import numpy as np
+import tqdm
 
 from .dataloader import get_dataloader
 from .pipeline import SkyReelsA1V2VInpaintPipeline
@@ -227,12 +228,26 @@ class Trainer:
         loss = loss / self.gradient_accumulation_steps
         self.accelerator.backward(loss)
         return loss.item()
+    
+    def init_pbar(self):
+        if self.accelerator.is_main_process:
+            self.pbar = tqdm.tqdm(
+                total=self.gradient_accumulation_steps, 
+                desc="substeps",
+                leave=False,
+            )
+
+    def step_pbar(self):
+        if self.accelerator.is_main_process:
+            self.pbar.update(1)
 
     def train(self):
         step = self.config.get("start_step", 0)
         max_steps = self.config.get("num_steps", 5000)
         save_frequency = self.config.get("save_frequency", 1000)
         self.optimizer.zero_grad()
+
+        self.init_pbar()
         while True:
             for batch in self.dataloader:
                 if step >= max_steps:
@@ -240,6 +255,7 @@ class Trainer:
                     return max_steps
                 loss = self.train_one_step(batch)
                 self._step_in_accum += 1
+                self.step_pbar()
                 if self._step_in_accum % self.gradient_accumulation_steps == 0:
                     self.optimizer.step()
                     # Only log to wandb on the main process
@@ -256,6 +272,7 @@ class Trainer:
                         if avg_val_loss is not None and self.config.wandb_enabled and self.accelerator.is_main_process:
                             wandb.log({"step": step, "val_loss": avg_val_loss})
                     step += 1
+                    self.init_pbar()
                     if step > 0 and self.accelerator.is_main_process:
                         timestamp = time.strftime("%H:%M:%S")
                         print(f"[{timestamp}] Step {step}/{max_steps}, Last loss: {loss:.4f}")

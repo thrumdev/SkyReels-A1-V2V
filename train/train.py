@@ -4,6 +4,8 @@ from peft import LoraConfig, get_peft_model
 import torch
 import os
 import time
+import cv2
+import np
 
 from .dataloader import get_dataloader
 from .pipeline import SkyReelsA1V2VInpaintPipeline
@@ -210,7 +212,7 @@ class Trainer:
                         wandb.log({"step": step, "loss": loss})
                     # Validation
                     if self.validation_steps and self.validation_steps > 0 and step % self.validation_steps == 0 and step > 0:
-                        avg_val_loss = self.validate()
+                        avg_val_loss = self.validate(step)
                         if avg_val_loss is not None and self.config.wandb_enabled and self.accelerator.is_main_process:
                             wandb.log({"step": step, "val_loss": avg_val_loss})
                     step += 1
@@ -248,11 +250,16 @@ class Trainer:
                 except Exception as e:
                     print(f"Error removing {old_ckpt_path}: {e}")
 
-    def validate(self):
+    def validate(self, step):
         if not self.validation_dataloader:
             return None
+        
+        if self.accelerator.is_main_process:
+            print(f"Running validation... step={step}")
+
         self.pipeline.transformer.eval()
         val_losses = []
+        first_item = None
         with torch.no_grad():
             for batch in self.validation_dataloader:
                 ref_videos = list(batch["ref_video"])
@@ -267,6 +274,14 @@ class Trainer:
                 masks = expand_masks_randomly(masks, self.config.get("max_mask_expand", 0))
                 num_train_timesteps = self.pipeline.scheduler.config.num_train_timesteps
                 timesteps = [torch.randint(0, num_train_timesteps, (1,), dtype=torch.long).item() for _ in range(len(ref_videos))]
+
+                if first_item is None:
+                    first_item = {
+                        "ref_video": ref_videos[0],
+                        "driving_video": driving_videos[0],
+                        "mask": masks[0],
+                        "identity_image": identity_images[0],
+                    }
                 loss = self.pipeline.step_forward_and_loss(
                     ref_videos,
                     driving_videos,
@@ -276,15 +291,63 @@ class Trainer:
                     timesteps,
                     height,
                     width,
-                    frames
                 )
                 val_losses.append(loss.item())
+
         # Gather losses from all processes
         gathered = self.accelerator.gather(torch.tensor(val_losses, device=self.accelerator.device))
         gathered = gathered.cpu().numpy().tolist()
-        self.pipeline.transformer.train()
         avg_val_loss = sum(gathered) / len(gathered) if gathered else None
+
+        self.save_full_inference_example(step, first_item)
+        self.pipeline.transformer.train()
+
         return avg_val_loss
+    
+    @torch.no_grad()
+    def save_full_inference_example(self, step, item):
+        if not self.accelerator.is_main_process:
+            return
+        
+        print(f"Saving full inference example for step {step}...")
+
+        height, width = item["ref_video"].shape[2], item["ref_video"].shape[3]
+        output = self.pipeline.full_inference(
+            [item["ref_video"]],
+            [item["driving_video"]],
+            [item["mask"]],
+            [item["identity_image"]],
+            height,
+            width,
+        ).squeeze(0)
+
+        mask_grayscale = item["mask"].repeat(3, 1, 1, 1)  # Convert mask to 3-channel grayscale
+
+        # Combine ref_video, output video, mask, landmarks in a H*2, W*2 grid.
+        top = torch.cat([item["ref_video"], output], dim=3)  # (C, T, H, W*2)
+        bottom = torch.cat([mask_grayscale, item["driving_video"]], dim=3)  # (C, T, H, W*2)
+        combined = torch.cat([top, bottom], dim=2)  # (C, T, H*2, W*2)
+
+        # If there are more than 20 files in the directory, remove the one with the smallest step number
+        val_save_dir = self.config.get("val_save_dir", "denoised")
+        if len(os.listdir(val_save_dir)) > 20:
+            files = os.listdir(val_save_dir)
+            files = [f for f in files if f.startswith("step_")]
+            files.sort(key=lambda x: int(x.split("_")[1].split(".")[0]))
+            if files:
+                oldest_file = files[0]
+                os.remove(os.path.join(val_save_dir, oldest_file))
+                print(f"Removed old validation example: {oldest_file}")
+
+        # Save the combined tensor as a video
+        video = (combined.permute(1, 2, 3, 0).cpu().numpy() * 255).astype(np.uint8)  # (T, H*2, W*2, C)
+        save_path = os.path.join(val_save_dir, f"step_{step}.mp4")
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(save_path, fourcc, 16.0, (width, height))
+        for frame in video:
+            out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        out.release()
     
 def logit_normal_uniform_blend(num_samples, num_train_timesteps, blend):
     """

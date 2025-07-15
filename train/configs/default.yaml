@@ -10,6 +10,7 @@ learning_rate: 1e-5
 num_steps: 20000
 save_frequency: 1000
 save_dir: checkpoints
+val_save_dir: validations
 batch_size: 4
 data_dir: "data/train"
 model_path: pretrained_models/SkyReels-A1-5B

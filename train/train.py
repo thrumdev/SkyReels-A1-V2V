@@ -231,7 +231,7 @@ class Trainer:
                         if avg_val_loss is not None and self.config.wandb_enabled and self.accelerator.is_main_process:
                             wandb.log({"step": step, "val_loss": avg_val_loss})
                     step += 1
-                    if step % 10 == 0 and self.accelerator.is_main_process:
+                    if step > 0 and self.accelerator.is_main_process:
                         timestamp = time.strftime("%H:%M:%S")
                         print(f"[{timestamp}] Step {step}/{max_steps}, Last loss: {loss:.4f}")
                     if step % save_frequency == 0 and self.accelerator.is_main_process:
@@ -318,7 +318,7 @@ class Trainer:
             self.save_full_inference_example(step, first_item)
         except Exception as e:
             print(f"Error saving full inference example: {e}")
-            
+
         self.pipeline.transformer.train()
 
         return avg_val_loss

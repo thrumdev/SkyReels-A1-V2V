@@ -211,7 +211,7 @@ class Trainer:
         return loss.item()
 
     def train(self):
-        step = 0
+        step = self.config.get("start_step", 0)
         max_steps = self.config.get("num_steps", 5000)
         save_frequency = self.config.get("save_frequency", 1000)
         self.optimizer.zero_grad()

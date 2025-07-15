@@ -373,7 +373,9 @@ class Trainer:
                     height,
                     width,
                 )
-                val_losses.append(loss.cpu().item())
+
+                # division here is for consistency with training loss.
+                val_losses.append(loss.cpu().item() / self.gradient_accumulation_steps)
 
         # Gather losses from all processes
         loss_tensor = torch.tensor(val_losses, device="cpu").to(self.accelerator.device)

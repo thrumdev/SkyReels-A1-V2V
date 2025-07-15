@@ -269,6 +269,9 @@ class Trainer:
         else:
             model.save_pretrained(save_dir)
 
+        optimizer_save = os.path.join(save_dir, "optimizer.pt")
+        torch.save(self.optimizer.state_dict(), optimizer_save)
+
         # Remove older checkpoints, keep only last max_checkpoints
         max_checkpoints = self.config.get("max_checkpoints", 5)
         parent_dir = self.config.get("save_dir", "checkpoints")

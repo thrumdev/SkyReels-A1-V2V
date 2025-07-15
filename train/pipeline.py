@@ -144,18 +144,18 @@ class SkyReelsA1V2VInpaintPipeline:
         num_frames: int,
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        p = self.transformer.config.patch_size
+        p = self.t_config.patch_size
         vae_scale_factor_spatial = 8
         grid_height = height // (vae_scale_factor_spatial * p)
         grid_width = width // (vae_scale_factor_spatial * p)
-        base_size_width = self.transformer.config.sample_width // p
-        base_size_height = self.transformer.config.sample_height // p
+        base_size_width = self.t_config.sample_width // p
+        base_size_height = self.t_config.sample_height // p
 
         grid_crops_coords = get_resize_crop_region_for_grid(
             (grid_height, grid_width), base_size_width, base_size_height
         )
         freqs_cos, freqs_sin = get_3d_rotary_pos_embed(
-            embed_dim=self.transformer.config.attention_head_dim,
+            embed_dim=self.t_config.attention_head_dim,
             crops_coords=grid_crops_coords,
             grid_size=(grid_height, grid_width),
             temporal_size=num_frames,

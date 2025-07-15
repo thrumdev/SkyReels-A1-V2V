@@ -94,5 +94,6 @@ def get_dataloader(data_dir, config, mode="train"):
         batch_size=config.batch_size,
         num_workers=8,
         prefetch_factor=1,
-        collate_fn=list_collate
+        collate_fn=list_collate,
+        shuffle=True,
     )

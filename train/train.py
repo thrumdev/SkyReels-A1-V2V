@@ -5,7 +5,7 @@ import torch
 import os
 import time
 import cv2
-import np
+import numpy as np
 
 from .dataloader import get_dataloader
 from .pipeline import SkyReelsA1V2VInpaintPipeline
@@ -46,6 +46,7 @@ def expand_mask(mask, expand_x, expand_y):
 def trim_batch_items(ref_videos, driving_videos, masks, optical_flow_masks, frames):
     """
     Trims/prunes each item in the batch to a random slice of 'frames' frames.
+    If there are fewer actual frames than 'frames', repeats the final frame to pad.
     Modifies the lists in-place.
     """
     for i in range(len(ref_videos)):
@@ -56,6 +57,20 @@ def trim_batch_items(ref_videos, driving_videos, masks, optical_flow_masks, fram
             driving_videos[i] = driving_videos[i][:, start_frame:start_frame + frames, :, :]
             masks[i] = masks[i][:, start_frame:start_frame + frames, :, :]
             optical_flow_masks[i] = optical_flow_masks[i][:, start_frame:start_frame + frames - 2, :, :]
+        elif actual_frames < frames:
+            pad_len = frames - actual_frames
+            # Pad ref_video
+            last_ref = ref_videos[i][:, -1:, :, :].repeat(1, pad_len, 1, 1)
+            ref_videos[i] = torch.cat([ref_videos[i], last_ref], dim=1)
+            # Pad driving_video
+            last_driving = driving_videos[i][:, -1:, :, :].repeat(1, pad_len, 1, 1)
+            driving_videos[i] = torch.cat([driving_videos[i], last_driving], dim=1)
+            # Pad mask
+            last_mask = masks[i][:, -1:, :, :].repeat(1, pad_len, 1, 1)
+            masks[i] = torch.cat([masks[i], last_mask], dim=1)
+            # Pad optical_flow_mask (T-2)
+            last_optical = optical_flow_masks[i][:, -1:, :, :].repeat(1, pad_len, 1, 1)
+            optical_flow_masks[i] = torch.cat([optical_flow_masks[i], last_optical], dim=1)
     return ref_videos, driving_videos, masks, optical_flow_masks
 
 def expand_masks_randomly(masks, max_expand):

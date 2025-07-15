@@ -170,6 +170,7 @@ class Trainer:
                 config, 
                 mode="val", 
             )
+            self.validation_dataloader = self.accelerator.prepare(self.validation_dataloader)
 
         # Gradient accumulation setup
         self.gradient_accumulation_steps = config.get("gradient_accumulation_steps", 1)
@@ -258,22 +259,22 @@ class Trainer:
                 self.step_pbar()
                 if self._step_in_accum % self.gradient_accumulation_steps == 0:
                     self.optimizer.step()
-                    # Only log to wandb on the main process
-                    if self.config.wandb_enabled and self.accelerator.is_main_process:
-                        grad_norm = self.gradient_norm()
-
-                        wandb.log({"step": step, "loss": loss, "grad_norm": grad_norm})
+                    grad_norm = self.gradient_norm()
 
                     self.optimizer.zero_grad()
 
                     # Validation
+                    avg_val_loss = None
                     if self.validation_steps and self.validation_steps > 0 and step % self.validation_steps == 0:
                         avg_val_loss = self.validate(step)
-                        if avg_val_loss is not None and self.config.wandb_enabled and self.accelerator.is_main_process:
-                            wandb.log({"step": step, "val_loss": avg_val_loss})
+
+                    if self.config.wandb_enabled and self.accelerator.is_main_process:
+                        wandb.log({"step": step, "loss": loss, "val_loss": avg_val_loss, "grad_norm": grad_norm})
+
                     step += 1
                     self.init_pbar()
-                    if step > 0 and self.accelerator.is_main_process:
+
+                    if self.accelerator.is_main_process:
                         timestamp = time.strftime("%H:%M:%S")
                         print(f"[{timestamp}] Step {step}/{max_steps}, Last loss: {loss:.4f}")
                     if step % save_frequency == 0 and self.accelerator.is_main_process:
@@ -335,7 +336,10 @@ class Trainer:
         val_losses = []
         first_item = None
         with torch.no_grad():
-            for batch in self.validation_dataloader:
+            data = self.validation_dataloader
+            if self.accelerator.is_main_process:
+                data = tqdm.tqdm(data, desc="validation", total=len(self.validation_dataloader))
+            for batch in data:
                 ref_videos, driving_videos, masks, optical_flow_masks, identity_images = self.batch_to_device(batch)
                 frames = 49
                 height, width = ref_videos[0].shape[2], ref_videos[0].shape[3]

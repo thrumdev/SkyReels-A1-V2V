@@ -170,7 +170,11 @@ class Trainer:
         masks = expand_masks_randomly(masks, self.config.get("max_mask_expand", 0))
 
         num_train_timesteps = self.pipeline.scheduler.config.num_train_timesteps
-        timesteps = [torch.randint(0, num_train_timesteps, (1,), dtype=torch.long).item() for _ in range(len(ref_videos))]
+        timesteps = logit_normal_uniform_blend(
+            num_samples=len(ref_videos),
+            num_train_timesteps=num_train_timesteps,
+            blend=self.config.get("logit_normal_blend", 0.6)
+        )
 
         loss = self.pipeline.step_forward_and_loss(
             ref_videos,
@@ -282,6 +286,37 @@ class Trainer:
         self.pipeline.transformer.train()
         avg_val_loss = sum(gathered) / len(gathered) if gathered else None
         return avg_val_loss
+    
+def logit_normal_uniform_blend(num_samples, num_train_timesteps, blend):
+    """
+    Sample `num_samples` timesteps from a blended distribution of logit-normal and uniform.
+    Args:
+        num_samples (int): Number of timesteps to sample.
+        num_train_timesteps (int): Total number of timesteps.
+        blend (float): Blending factor between logit-normal and uniform.
+    Returns:
+        List[int]: Sampled timesteps, clamped to the range [0, num_train_timesteps - 1].
+    """
+    mu = 0.0
+    sigma = 1.0
+    # Logit-normal component
+    z = torch.randn(num_samples) * sigma + mu
+    x_logit = torch.sigmoid(z)
+    # Uniform component
+    x_uniform = torch.rand(num_samples)
+    x_choice = torch.rand(num_samples)
+
+    # Blend
+    x_blend = torch.where(
+        x_choice < blend,
+        x_logit,
+        x_uniform
+    )
+
+    # Scale to timesteps and quantize
+    t = (x_blend * (num_train_timesteps - 1)).to(torch.int64)
+    t = torch.clamp(t, 0, num_train_timesteps - 1)
+    return list(t)
 
 def main():
     import sys

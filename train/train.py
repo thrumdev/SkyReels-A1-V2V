@@ -249,14 +249,14 @@ class Trainer:
         self.optimizer.zero_grad()
 
         self.init_pbar()
-        batch_loss = 0
+        batch_losses = []
 
         while True:
             for batch in self.dataloader:
                 if step >= max_steps:
                     print(f"Reached maximum training steps: {max_steps}. Stopping training.")
                     return max_steps
-                batch_loss += self.train_one_step(batch)
+                batch_losses.append(self.train_one_step(batch))
                 self._step_in_accum += 1
                 self.step_pbar()
                 if self._step_in_accum % self.gradient_accumulation_steps == 0:
@@ -264,6 +264,9 @@ class Trainer:
                     grad_norm = self.gradient_norm()
 
                     self.optimizer.zero_grad()
+
+                    batch_losses = torch.tensor(batch_losses, device=self.accelerator.device)
+                    batch_loss = self.accelerator.gather(batch_losses).mean().item()
 
                     # Validation
                     avg_val_loss = None
@@ -282,7 +285,7 @@ class Trainer:
                     if step % save_frequency == 0 and self.accelerator.is_main_process:
                         self.save(step)
 
-                    batch_loss = 0
+                    batch_losses = []
 
     def gradient_norm(self):
         """

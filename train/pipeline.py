@@ -7,6 +7,7 @@ from diffusers.schedulers import CogVideoXDDIMScheduler
 from transformers import AutoModelForDepthEstimation, AutoProcessor, SiglipImageProcessor, SiglipVisionModel
 from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 from einops import rearrange
+from tqdm import tqdm
 
 from typing import Tuple
 import inspect
@@ -135,7 +136,7 @@ class SkyReelsA1V2VInpaintPipeline:
             model_name,
             subfolder="scheduler"
         )
-        self.inference_timesteps = 40
+        self.inference_timesteps = 20
         self.vae_scaling_factor_image = self.vae.config.scaling_factor
 
         if config.get("compile", False):
@@ -243,6 +244,8 @@ class SkyReelsA1V2VInpaintPipeline:
                 noise, 
                 torch.tensor(timesteps, dtype=torch.int64, device=self.device)
             )
+        else:
+            noise = None
 
         # note: this is a no-op anyway with this scheduler, but would require looping for this impl
         # so we skip it
@@ -347,6 +350,7 @@ class SkyReelsA1V2VInpaintPipeline:
     @torch.no_grad()
     def full_inference(
         self,
+        transformer,
         ref_videos, 
         driving_videos, 
         pixel_masks,
@@ -356,8 +360,9 @@ class SkyReelsA1V2VInpaintPipeline:
     ):
         """
         Performs a full inference trajectory of the pipeline as it stands.
-        This uses CFG with a guidance scale of 3.0 over 40 inference steps.
+        This uses CFG with a guidance scale of 3.0 over 20 inference steps.
         Args:
+            transformer: The unwrapped transformer model.
             ref_videos: List of reference video tensors (C, T, H, W)
             driving_videos: List of driving video tensors (C, T, H, W)
             pixel_masks: List of pixel mask tensors (1, T, H, W)
@@ -372,14 +377,14 @@ class SkyReelsA1V2VInpaintPipeline:
 
         batch_size = len(ref_videos)
         guidance_scale = 3.0
-        noisy_latent = torch.randn((2 * batch_size, 16, 13, 60, 90))
+        noisy_latent = torch.randn((batch_size, 16, 13, 60, 90), device=self.device)
         latent_masks = self.prepare_masks(pixel_masks)
         model_inputs, _ = self.prepare_latent(
             ref_videos, 
             driving_videos, 
             pixel_masks, 
             latent_masks, 
-            [0] * 2 * batch_size, #not used
+            [0] * batch_size, #not used
             noisy_latent=noisy_latent,
         )
         model_inputs = torch.cat([model_inputs, model_inputs], dim=0)  # Duplicate for CFG
@@ -395,7 +400,7 @@ class SkyReelsA1V2VInpaintPipeline:
 
         timesteps, num_inference_steps = retrieve_timesteps_for_inference(
             self.inference_scheduler,
-            40,
+            self.inference_timesteps,
             self.device, 
             None,
         )
@@ -403,12 +408,12 @@ class SkyReelsA1V2VInpaintPipeline:
         # Swap channels/frames -> (B, T, C, H', W')
         model_inputs = model_inputs.permute(0, 2, 1, 3, 4)
 
-        for i, t in enumerate(timesteps):
-            model_inputs = model_inputs.to(self.transformer.device, self.dtype)
-            image_embeddings = image_embeddings.to(self.transformer.device, self.dtype)
+        for i, t in enumerate(tqdm(timesteps)):
+            model_inputs = model_inputs.to(transformer.device, self.dtype)
+            image_embeddings = image_embeddings.to(transformer.device, self.dtype)
 
             timestep = t.expand(model_inputs.shape[0])
-            noise_pred = self.transformer(
+            noise_pred = transformer(
                 hidden_states=model_inputs,
                 encoder_hidden_states=image_embeddings,
                 timestep=timestep,

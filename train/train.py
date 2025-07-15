@@ -362,10 +362,11 @@ class Trainer:
                     height,
                     width,
                 )
-                val_losses.append(loss.item())
+                val_losses.append(loss.cpu().item())
 
         # Gather losses from all processes
-        gathered = self.accelerator.gather(torch.tensor(val_losses, device=self.accelerator.device))
+        loss_tensor = torch.tensor(val_losses, device="cpu").to(self.accelerator.device)
+        gathered = self.accelerator.gather(loss_tensor)
         gathered = gathered.cpu().numpy().tolist()
         avg_val_loss = sum(gathered) / len(gathered) if gathered else None
 
@@ -383,7 +384,9 @@ class Trainer:
         print(f"Saving full inference example for step {step}...")
 
         height, width = item["ref_video"].shape[2], item["ref_video"].shape[3]
+        transformer = self.accelerator.unwrap_model(self.pipeline.transformer)
         output = self.pipeline.full_inference(
+            transformer,
             [item["ref_video"]],
             [item["driving_video"]],
             [item["mask"]],
@@ -401,6 +404,7 @@ class Trainer:
 
         # If there are more than 20 files in the directory, remove the one with the smallest step number
         val_save_dir = self.config.get("val_save_dir", "denoised")
+        os.makedirs(val_save_dir, exist_ok=True)
         if len(os.listdir(val_save_dir)) > 20:
             files = os.listdir(val_save_dir)
             files = [f for f in files if f.startswith("step_")]
@@ -413,9 +417,8 @@ class Trainer:
         # Save the combined tensor as a video
         video = (combined.permute(1, 2, 3, 0).cpu().numpy() * 255).astype(np.uint8)  # (T, H*2, W*2, C)
         save_path = os.path.join(val_save_dir, f"step_{step}.mp4")
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(save_path, fourcc, 16.0, (width, height))
+        out = cv2.VideoWriter(save_path, fourcc, 16.0, (width*2, height*2))
         for frame in video:
             out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         out.release()

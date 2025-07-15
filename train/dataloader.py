@@ -90,9 +90,13 @@ def get_dataloader(data_dir, config, mode="train"):
     """
     dataset = SkyReelsV2VDataset(data_dir, mode)
     num_workers = config.get("dataloader_workers", 5)
+    if mode == "train":
+        batch_size = config.batch_size
+    else if mode == "val":
+        batch_size = config.get("val_batch_size", config.batch_size)    
     return DataLoader(
         dataset,
-        batch_size=config.batch_size,
+        batch_size=batch_size,
         num_workers=num_workers,
         prefetch_factor=1,
         collate_fn=list_collate,

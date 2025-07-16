@@ -126,6 +126,7 @@ class Trainer:
                 print("Restoring saved LoRa")
                 self.pipeline.transformer = PeftModel.from_pretrained(
                     self.pipeline.transformer,
+                    model_id=restore_checkpoint,
                     is_trainable=True,
                 )
         else:

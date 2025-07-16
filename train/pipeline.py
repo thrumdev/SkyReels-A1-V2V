@@ -103,7 +103,7 @@ class SkyReelsA1V2VInpaintPipeline:
         restore_checkpoint = config.get("restore_checkpoint", None)
 
         # We restore the full model only if no lora rank is specified.
-        if restore_checkpoint is None or config.get("lora_rank") is None:
+        if restore_checkpoint is None or config.get("lora_rank") is not None:
             self.transformer = CogVideoXTransformer3DModel.from_pretrained(
                 model_name,
                 subfolder="transformer",
@@ -138,6 +138,7 @@ class SkyReelsA1V2VInpaintPipeline:
         )
         self.inference_timesteps = 20
         self.vae_scaling_factor_image = self.vae.config.scaling_factor
+        self.lmk_scaling_factor_image = self.lmk_encoder.config.scaling_factor
 
         if config.get("compile", False):
             self.vae.encode = torch.compile(self.vae.encode)
@@ -257,6 +258,7 @@ class SkyReelsA1V2VInpaintPipeline:
         ref_latent = self.vae.encode(ref_videos).latent_dist.mode() * self.vae_scaling_factor_image
 
         lmk_latent = self.lmk_encoder.encode(driving_videos).latent_dist.mode()
+        lmk_latent *= self.lmk_scaling_factor_image
 
         # concatenate along channel dimension (B, C, T', H', W')
         model_input = torch.cat([noisy_latent, lmk_latent, ref_latent, latent_masks], dim=1)

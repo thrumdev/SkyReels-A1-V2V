@@ -95,15 +95,6 @@ class Trainer:
             config, 
         )
         self.wandb_enabled = config.get("wandb_enabled", False)
-        if self.wandb_enabled and self.accelerator.is_main_process:
-            wandb.init(
-                project=config.get("wandb_project", "skyreels-a1-v2v"),
-                name=config.get("wandb_name", None),
-            )
-
-            # make wandb graph catch up.
-            for _ in range(self.config.get("start_step", 0)):
-                wandb.log({"loss": None})
 
         device = self.accelerator.device
         self.pipeline = SkyReelsA1V2VInpaintPipeline(config, device)
@@ -160,6 +151,11 @@ class Trainer:
             print("restoring optimizer state")
             optimizer_path = os.path.join(restore_checkpoint, "optimizer.pt")
             optimizer_state = torch.load(optimizer_path, map_location=self.accelerator.device)
+
+            # Override LR
+            for optimizer_param in optimizer_state['param_groups']:
+                optimizer_param['lr'] = lr
+
             optimizer.load_state_dict(optimizer_state)
 
         if config.get("compile", False):
@@ -184,6 +180,16 @@ class Trainer:
         # Gradient accumulation setup
         self.gradient_accumulation_steps = config.get("gradient_accumulation_steps", 1)
         self._step_in_accum = 0
+
+        if self.wandb_enabled and self.accelerator.is_main_process:
+            wandb.init(
+                project=config.get("wandb_project", "skyreels-a1-v2v"),
+                name=config.get("wandb_name", None),
+            )
+
+            # make wandb graph catch up.
+            for _ in range(self.config.get("start_step", 0)):
+                wandb.log({"loss": None})
 
     def batch_to_device(self, batch):
         # Pipeline expects lists of tensors, not batched tensors

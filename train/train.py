@@ -217,7 +217,7 @@ class Trainer:
             blend=self.config.get("logit_normal_blend", 0.6)
         )
 
-        loss = self.pipeline.step_forward_and_loss(
+        loss, inpaint_loss, optical_loss = self.pipeline.step_forward_and_loss(
             ref_videos,
             driving_videos,
             masks,
@@ -229,7 +229,7 @@ class Trainer:
         )
         loss = loss / self.gradient_accumulation_steps
         self.accelerator.backward(loss)
-        return loss.item()
+        return loss.item(), inpaint_loss, optical_loss
     
     def init_pbar(self):
         if self.accelerator.is_main_process:
@@ -251,6 +251,8 @@ class Trainer:
 
         self.init_pbar()
         batch_losses = []
+        batch_inpaint_losses = []
+        batch_optical_losses = []
 
         while True:
             for batch in self.dataloader:
@@ -269,13 +271,26 @@ class Trainer:
                     batch_losses = torch.tensor(batch_losses, device=self.accelerator.device)
                     batch_loss = self.accelerator.gather(batch_losses).mean().item()
 
+                    batch_inpaint_losses = torch.tensor(batch_inpaint_losses, device=self.accelerator.device)
+                    batch_inpaint_loss = self.accelerator.gather(batch_inpaint_losses).mean().item()
+
+                    batch_optical_losses = torch.tensor(batch_optical_losses, device=self.accelerator.device)
+                    batch_optical_loss = self.accelerator.gather(batch_optical_losses).mean().item()
+
                     # Validation
                     avg_val_loss = None
                     if self.validation_steps and self.validation_steps > 0 and step % self.validation_steps == 0:
                         avg_val_loss = self.validate(step)
 
                     if self.config.wandb_enabled and self.accelerator.is_main_process:
-                        wandb.log({"step": step, "loss": batch_loss, "val_loss": avg_val_loss, "grad_norm": grad_norm})
+                        wandb.log({
+                            "step": step, 
+                            "loss": batch_loss, 
+                            "val_loss": avg_val_loss, 
+                            "grad_norm": grad_norm,
+                            "inpaint_loss": batch_inpaint_loss,
+                            "optical_loss": batch_optical_loss,
+                        })
 
                     step += 1
                     self.init_pbar()
@@ -287,6 +302,8 @@ class Trainer:
                         self.save(step)
 
                     batch_losses = []
+                    batch_inpaint_losses = []
+                    batch_optical_losses = []
 
     def gradient_norm(self):
         """

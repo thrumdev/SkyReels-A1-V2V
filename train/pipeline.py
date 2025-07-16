@@ -347,7 +347,8 @@ class SkyReelsA1V2VInpaintPipeline:
             optical_flow_masks,
         )
         
-        return self.config.get("inpaint_lambda", 1.0) * inpaint_loss + self.config.get("optical_flow_lambda", 1.0) * optical_flow_loss
+        final_loss = self.config.get("inpaint_lambda", 1.0) * inpaint_loss + self.config.get("optical_flow_lambda", 1.0) * optical_flow_loss
+        return final_loss, inpaint_loss.item(), optical_flow_loss.item()
     
     @torch.no_grad()
     def full_inference(

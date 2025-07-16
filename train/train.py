@@ -151,7 +151,7 @@ class Trainer:
         if restore_checkpoint is not None:
             print("restoring optimizer state")
             optimizer_path = os.path.join(restore_checkpoint, "optimizer.pt")
-            optimizer_state = torch.load(optimizer_path)
+            optimizer_state = torch.load(optimizer_path, map_location=self.accelerator.device)
             optimizer.load_state_dict(optimizer_state)
 
         if config.get("compile", False):

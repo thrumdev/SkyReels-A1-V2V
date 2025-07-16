@@ -101,6 +101,10 @@ class Trainer:
                 name=config.get("wandb_name", None),
             )
 
+            # make wandb graph catch up.
+            for _ in range(self.config.get("start_step", 0)):
+                wandb.log({"loss": None})
+
         device = self.accelerator.device
         self.pipeline = SkyReelsA1V2VInpaintPipeline(config, device)
         self.pipeline.transformer.train()
@@ -124,11 +128,15 @@ class Trainer:
                 self.pipeline.transformer = get_peft_model(self.pipeline.transformer, lora_config)
             else:
                 print("Restoring saved LoRa")
+
+                # PeftModel will load the adapter for each process and put each copy of the weights 
+                # on cuda:0 unless we specify torch_device.
                 self.pipeline.transformer = PeftModel.from_pretrained(
                     self.pipeline.transformer,
                     model_id=restore_checkpoint,
                     is_trainable=True,
-                )
+                    torch_device=str(self.accelerator.device)
+                ).to(self.accelerator.device) # additional paranoid to(device)
         else:
             print("Training without LoRA")
             self.pipeline.transformer.requires_grad_(True)
@@ -259,7 +267,12 @@ class Trainer:
                 if step >= max_steps:
                     print(f"Reached maximum training steps: {max_steps}. Stopping training.")
                     return max_steps
-                batch_losses.append(self.train_one_step(batch))
+                
+                final_loss, inpaint_loss, optical_loss = self.train_one_step(batch)
+                batch_losses.append(final_loss)
+                batch_inpaint_losses.append(inpaint_loss)
+                batch_optical_losses.append(optical_loss)
+
                 self._step_in_accum += 1
                 self.step_pbar()
                 if self._step_in_accum % self.gradient_accumulation_steps == 0:
@@ -382,7 +395,7 @@ class Trainer:
                         "mask": masks[0],
                         "identity_image": identity_images[0],
                     }
-                loss = self.pipeline.step_forward_and_loss(
+                loss, _, _ = self.pipeline.step_forward_and_loss(
                     ref_videos,
                     driving_videos,
                     masks,

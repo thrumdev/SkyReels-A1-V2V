@@ -445,7 +445,7 @@ class Trainer:
         # Combine ref_video, output video, mask, landmarks in a H*2, W*2 grid.
         top = torch.cat([item["ref_video"], output], dim=3)  # (C, T, H, W*2)
         bottom = torch.cat([mask_grayscale, item["driving_video"]], dim=3)  # (C, T, H, W*2)
-        combined = torch.cat([top, bottom], dim=2)  # (C, T, H*2, W*2)
+        combined = torch.cat([top, bottom], dim=2).contiguous()  # (C, T, H*2, W*2)
 
         # If there are more than 20 files in the directory, remove the one with the smallest step number
         val_save_dir = self.config.get("val_save_dir", "denoised")

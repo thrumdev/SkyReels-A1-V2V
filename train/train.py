@@ -297,7 +297,8 @@ class Trainer:
 
                     if self.accelerator.is_main_process:
                         timestamp = time.strftime("%H:%M:%S")
-                        print(f"[{timestamp}] Step {step}/{max_steps}, Last loss: {batch_loss:.4f}")
+                        print(f"[{timestamp}] Step {step}/{max_steps}, Loss: {batch_loss:.4f}")
+                        print(f"\t inpaint loss={batch_inpaint_loss} optical loss={batch_optical_loss}")
                     if step % save_frequency == 0 and self.accelerator.is_main_process:
                         self.save(step)
 

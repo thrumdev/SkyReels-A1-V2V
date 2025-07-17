@@ -427,9 +427,11 @@ class Trainer:
             return
         
         batch = list_collate([self.inference_example])
-        ref_videos, driving_videos, masks, _,  identity_images = self.batch_to_device(batch)
+        ref_videos, driving_videos, masks, optical_flow_masks,  identity_images = self.batch_to_device(batch)
         height, width = ref_videos[0].shape[2], ref_videos[0].shape[3]
         print(f"Saving full inference example ({name})...")
+
+        ref_videos, driving_videos, masks, _ = trim_batch_items(ref_videos, driving_videos, masks, optical_flow_masks, 49)
 
         transformer = self.accelerator.unwrap_model(self.pipeline.transformer)
         output = self.pipeline.full_inference(

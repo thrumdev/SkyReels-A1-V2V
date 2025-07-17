@@ -115,7 +115,11 @@ class SkyReelsA1V2VInpaintPipeline:
                 restore_checkpoint,
             ).to(device, self.dtype)
 
-        self.transformer.patch_embed.expand_proj_channels(48 + 64) # Add the mask channels if necessary.
+        self.explicit_mask_channels = self.config.get("explicit_mask_channels", False)
+        self.ref_frames_strength = self.config.get("ref_frames_strength", 0.01)
+
+        if self.explicit_mask_channels:
+            self.transformer.patch_embed.expand_proj_channels(48 + 64) # Add the mask channels if necessary.
 
         self.vae = AutoencoderKLCogVideoX.from_pretrained(
             model_name, 
@@ -253,15 +257,22 @@ class SkyReelsA1V2VInpaintPipeline:
         # noisy_latent = self.scheduler.scale_model_input(noisy_latent, timesteps)
 
         # Cut out all pixels in the mask from the reference.
+        # We leave the first frame intact.
         pixel_mask = pixel_masks[:, :, 1:, :, :]
         ref_videos[:, :, 1:, :, :] *= (1.0 - pixel_mask)
+
+        # Apply darkening to the reference frames (after first)
+        ref_videos[:, :, 1:, :, :] *= self.ref_frames_strength
         ref_latent = self.vae.encode(ref_videos).latent_dist.mode() * self.vae_scaling_factor_image
 
         lmk_latent = self.lmk_encoder.encode(driving_videos).latent_dist.mode()
         lmk_latent *= self.lmk_scaling_factor_image
 
         # concatenate along channel dimension (B, C, T', H', W')
-        model_input = torch.cat([noisy_latent, lmk_latent, ref_latent, latent_masks], dim=1)
+        if self.explicit_mask_channels:
+            model_input = torch.cat([noisy_latent, lmk_latent, ref_latent, latent_masks], dim=1)
+        else:
+            model_input = torch.cat([noisy_latent, lmk_latent, ref_latent], dim=1)
 
         return model_input, noise
 

@@ -270,6 +270,7 @@ class Trainer:
         batch_inpaint_losses = []
         batch_optical_losses = []
 
+        fresh = True
         while True:
             for batch in self.dataloader:
                 if step >= max_steps:
@@ -300,8 +301,10 @@ class Trainer:
 
                     # Validation
                     avg_val_loss = None
-                    if self.validation_steps and self.validation_steps > 0 and step % self.validation_steps == 0:
+                    if self.validation_steps and self.validation_steps > 0 and step % self.validation_steps == 0 and not fresh:
                         avg_val_loss = self.validate(step)
+                        
+                    fresh = False
 
                     if self.config.wandb_enabled and self.accelerator.is_main_process:
                         wandb.log({
@@ -393,7 +396,11 @@ class Trainer:
                 ref_videos, driving_videos, masks, optical_flow_masks = trim_batch_items(ref_videos, driving_videos, masks, optical_flow_masks, frames)
                 masks = expand_masks_randomly(masks, self.config.get("max_mask_expand", 0))
                 num_train_timesteps = self.pipeline.scheduler.config.num_train_timesteps
-                timesteps = [torch.randint(0, num_train_timesteps, (1,), dtype=torch.long).item() for _ in range(len(ref_videos))]
+                timesteps = logit_normal_uniform_blend(
+                    num_samples=len(ref_videos),
+                    num_train_timesteps=num_train_timesteps,
+                    blend=self.config.get("logit_normal_blend", 0.6)
+                )
 
                 loss, _, _ = self.pipeline.step_forward_and_loss(
                     ref_videos,
@@ -449,7 +456,7 @@ class Trainer:
         # Combine ref_video, output video, mask, landmarks in a H*2, W*2 grid.
         top = torch.cat([ref_videos[0], output], dim=3)  # (C, T, H, W*2)
         bottom = torch.cat([mask_grayscale, driving_videos[0]], dim=3)  # (C, T, H, W*2)
-        combined = torch.cat([top, bottom], dim=2).contiguous()  # (C, T, H*2, W*2)
+        combined = torch.cat([top, bottom], dim=2).float().contiguous()  # (C, T, H*2, W*2)
 
         # If there are more than 20 files in the directory, remove the one with the smallest step number
         val_save_dir = self.config.get("val_save_dir", "denoised")
@@ -501,7 +508,7 @@ def logit_normal_uniform_blend(num_samples, num_train_timesteps, blend):
     # Scale to timesteps and quantize
     t = (x_blend * (num_train_timesteps - 1)).to(torch.int64)
     t = torch.clamp(t, 0, num_train_timesteps - 1)
-    return list(t)
+    return [int(x.item()) for x in t]
 
 def main():
     import sys

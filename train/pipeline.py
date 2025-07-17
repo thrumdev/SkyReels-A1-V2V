@@ -141,7 +141,7 @@ class SkyReelsA1V2VInpaintPipeline:
             model_name,
             subfolder="scheduler"
         )
-        self.inference_timesteps = 20
+        self.inference_timesteps = 5
         self.vae_scaling_factor_image = self.vae.config.scaling_factor
         self.lmk_scaling_factor_image = self.lmk_encoder.config.scaling_factor
 
@@ -232,9 +232,10 @@ class SkyReelsA1V2VInpaintPipeline:
             latent_masks: List of latent mask tensors (64, T', H', W')
             timesteps: List of timesteps
 
-        Returns model inputs (B, C, T', H', W') and noise (B, C, T', H', W').
+        Returns model inputs (B, kC', T', H', W') and clean latents (B, C', T', H', W').
         The model inputs are concatenated along the channel dimension in the order:
-            [noisy_latent, lmk_latent, ref_latent, latent_mask]
+            [noisy_latent, lmk_latent, ref_latent, latent_mask] with k = 3 or 4 depending on
+            whether `self.explicit_mask_channels` is set to True or False.
         """
 
         ref_videos = torch.stack(ref_videos, dim=0).to(self.device, self.dtype) # (B, C, T, H, W)
@@ -242,8 +243,13 @@ class SkyReelsA1V2VInpaintPipeline:
         pixel_masks = torch.stack(pixel_masks, dim=0).to(self.device, self.dtype)  # (B, 1, T, H, W)
         latent_masks = torch.stack(latent_masks, dim=0).to(self.device, self.dtype)  # (B, 64, T', H', W')
 
+        # Normalize: [0, 1] -> [-1, 1]
+        ref_videos = ref_videos * 2.0 - 1.0
+        driving_videos = driving_videos * 2.0 - 1.0
+
         if noisy_latent is None:
             clean_latent = self.vae.encode(ref_videos).latent_dist.sample()  # (B, C, T', H', W_)
+            clean_latent = clean_latent * self.vae_scaling_factor_image
             noise = torch.randn_like(clean_latent, device=ref_videos.device, dtype=self.dtype)
             noisy_latent = self.scheduler.add_noise(
                 clean_latent, 
@@ -251,7 +257,7 @@ class SkyReelsA1V2VInpaintPipeline:
                 torch.tensor(timesteps, dtype=torch.int64, device=self.device)
             )
         else:
-            noise = None
+            clean_latent = None
 
         # note: this is a no-op anyway with this scheduler, but would require looping for this impl
         # so we skip it
@@ -264,7 +270,7 @@ class SkyReelsA1V2VInpaintPipeline:
 
         # Apply darkening to the reference frames (after first)
         ref_videos[:, :, 1:, :, :] *= self.ref_frames_strength
-        ref_latent = self.vae.encode(ref_videos).latent_dist.mode() * self.vae_scaling_factor_image
+        ref_latent = self.vae.encode(ref_videos).latent_dist.sample() * self.vae_scaling_factor_image
 
         lmk_latent = self.lmk_encoder.encode(driving_videos).latent_dist.mode()
         lmk_latent *= self.lmk_scaling_factor_image
@@ -275,7 +281,7 @@ class SkyReelsA1V2VInpaintPipeline:
         else:
             model_input = torch.cat([noisy_latent, lmk_latent, ref_latent], dim=1)
 
-        return model_input, noise
+        return model_input, clean_latent
 
     @torch.no_grad()
     def embed_reference_prompt(self, identity_images):
@@ -322,7 +328,7 @@ class SkyReelsA1V2VInpaintPipeline:
         """
 
         latent_masks = self.prepare_masks(pixel_masks)
-        model_inputs, noise_gt = self.prepare_latent(
+        model_inputs, clean_latents = self.prepare_latent(
             ref_videos, 
             driving_videos, 
             pixel_masks, 
@@ -338,7 +344,7 @@ class SkyReelsA1V2VInpaintPipeline:
         )
 
         model_inputs = model_inputs.permute(0, 2, 1, 3, 4) # Swap channels/frames
-        noise_pred = self.transformer(
+        velocity = self.transformer(
             hidden_states=model_inputs.to(self.transformer.device, self.dtype),
             encoder_hidden_states=image_embeddings.to(self.transformer.device, self.dtype),
             timestep=torch.tensor(timesteps, dtype=self.dtype, device=self.device),
@@ -346,21 +352,53 @@ class SkyReelsA1V2VInpaintPipeline:
             return_dict=False,
         )[0]
 
-        noise_pred = noise_pred.permute(0, 2, 1, 3, 4)  # Swap channels/frames back
+        # Copying from finetrainers:
+        # CogVideoX returns a velocity. The prediction is given by applying the same
+        # code paths as scheduler.get_velocity(), which can be confusing to understand.
+        # note that we swap the first two arguments to get_velocity to yield x_0
+        noisy_latents = model_inputs[:, :, 0:16, :, :]
+        pred_x0 = self.scheduler.get_velocity(velocity, noisy_latents, torch.tensor(timesteps))
 
-        noise_pred = noise_pred.float()
-        noise_gt = noise_gt.float()
+        pred_x0 = pred_x0.permute(0, 2, 1, 3, 4)  # Swap channels/frames back
+
+        pred_x0 = pred_x0.float()
+        target = clean_latents.float()
+
         latent_masks = self.flatten_latent_mask(latent_masks).to(self.device)
-        inpaint_loss = self.compute_inpaint_loss(noise_pred, noise_gt, latent_masks)
+        inpaint_loss = self.compute_inpaint_loss(pred_x0, target, latent_masks)
         optical_flow_loss = self.compute_masked_optical_flow_loss(
-            noise_pred,
-            noise_gt,
+            pred_x0,
+            target,
             latent_masks,
             optical_flow_masks,
         )
+
+        inpaint_loss = self.timestep_weighted_loss(inpaint_loss, timesteps)
+        optical_flow_loss = self.timestep_weighted_loss(optical_flow_loss, timesteps)
         
         final_loss = self.config.get("inpaint_lambda", 1.0) * inpaint_loss + self.config.get("optical_flow_lambda", 1.0) * optical_flow_loss
+
+        # note: we need to weight the loss by timestep
+        # finetrainers uses 
+        # 1 / (1 - alphas_cumprod[timesteps])
+        # but for this we need to compute the losses separately per batch item
         return final_loss, inpaint_loss.item(), optical_flow_loss.item()
+
+    def timestep_weighted_loss(self, losses, timesteps):
+        """
+        Computes the timestep weighted loss.
+        Args:
+            losses: Tensor ([B]) of losses for each batch item.
+            timesteps: List of timesteps for each batch item.
+        Returns:
+            A tensor of the weighted loss.
+        """
+        alphas_cumprod = self.scheduler.alphas_cumprod
+        # note: we copy from finetrainers `prepare_loss_weights` on the loss weighting
+        # but they say "SNR is computed as (alphas / (1 - alphas)), but for some reason CogVideoX 
+        # uses 1 / (1 - alphas). Experiment if using alphas / (1 - alphas) gives better results."
+        weights = 1 / (1 - alphas_cumprod[timesteps]) # (B,)
+        return torch.mean(losses * weights)
     
     @torch.no_grad()
     def full_inference(
@@ -375,7 +413,7 @@ class SkyReelsA1V2VInpaintPipeline:
     ):
         """
         Performs a full inference trajectory of the pipeline as it stands.
-        This uses CFG with a guidance scale of 3.0 over 20 inference steps.
+        This uses CFG with a guidance scale of 3.0 over 5 inference steps.
         Args:
             transformer: The unwrapped transformer model.
             ref_videos: List of reference video tensors (C, T, H, W)
@@ -422,7 +460,6 @@ class SkyReelsA1V2VInpaintPipeline:
 
         # Swap channels/frames -> (B, T, C, H', W')
         model_inputs = model_inputs.permute(0, 2, 1, 3, 4)
-
         for i, t in enumerate(tqdm(timesteps)):
             model_inputs = model_inputs.to(transformer.device, self.dtype)
             image_embeddings = image_embeddings.to(transformer.device, self.dtype)
@@ -441,14 +478,16 @@ class SkyReelsA1V2VInpaintPipeline:
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred - noise_pred_uncond)
 
             # update the noisy latents, leave the rest of the model inputs untouched.
-            latents = model_inputs[:batch_size, :, 0:16, :, :].float()
+            latents = model_inputs[batch_size:, :, 0:16, :, :].float()
             latents = self.inference_scheduler.step(noise_pred, t, latents, return_dict=False)[0]
             latents = torch.cat([latents, latents], dim=0).to(model_inputs.dtype)
             model_inputs[:, :, 0:16, :, :] = latents
 
-        latents = latents[:batch_size].permute(0, 2, 1, 3, 4)  # (B, C, T', H', W')
+        latents = latents[batch_size:].permute(0, 2, 1, 3, 4)  # (B, C, T', H', W')
         latents = latents * (1 / self.vae_scaling_factor_image)
-        return self.vae.decode(latents).sample
+        out = self.vae.decode(latents).sample
+        out = torch.clamp(out * 0.5 + 0.5, min=0.0, max=1.0)  # Scale back to [0, 1]
+        return out 
 
     @torch.no_grad()
     def flatten_latent_mask(self, latent_masks):
@@ -465,35 +504,37 @@ class SkyReelsA1V2VInpaintPipeline:
 
         latent_mask = torch.stack(latent_masks, dim=0)
         return latent_mask.mean(dim=1, keepdim=True)
-    
-    def compute_inpaint_loss(self, noise_pred, noise_gt, latent_mask):
+
+    def compute_inpaint_loss(self, pred_x0, target, latent_mask):
         """
-        Computes the MSE loss between noise_pred and noise_gt, but only for elements where latent_mask == 0 (i.e., outside the mask).
+        Computes the MSE loss between pred_x0 and target, but only for elements where latent_mask == 0 (i.e., outside the mask).
         Args:
-            noise_pred: Predicted noise tensor (B, C, T, H, W) or (B, C, H, W)
-            noise_gt: Ground truth noise tensor, same shape as noise_pred
+            pred_x0: Predicted latent output (B, C, T', H', W')
+            target: Clean latents as desired output, same shape as pred_x0
             latent_mask: Binary mask tensor, (B, 1, T', H', W') where 1=inside mask, 0=outside.
                 intermediate values indicate partial masking within the latent subpixel.
         Returns:
-            Scalar loss (averaged over outside-mask elements)
+            Loss tensor (per batch element) shape (B,)
         """
         outside_mask = (1.0 - latent_mask).float()
-        loss = ((noise_pred - noise_gt) ** 2) * outside_mask
-        denom = outside_mask.sum() + 1e-8
-        return loss.sum() / denom
+        loss = ((pred_x0 - target) ** 2) * outside_mask
+        denom = outside_mask.sum(dim=(1, 2, 3, 4)) + 1e-8 # (B,)
+        return loss.sum(dim=(1, 2, 3, 4)) / denom
 
-    def compute_masked_optical_flow_loss(self, noise_pred, noise_gt, latent_mask, optical_flow_mask):
+    def compute_masked_optical_flow_loss(self, pred_x0, target, latent_mask, optical_flow_mask):
         """
         Computes the masked optical flow loss between ref_video and gen_video, using pixel_mask 
         to filter out masked regions entirely.
 
         Args:
-            noise_pred: Predicted noise tensor (B, C, T', H', W')
-            noise_gt: Ground truth noise tensor, same shape as noise_pred
+            pred_x0: Predicted latent output (B, C, T', H', W')
+            target: Clean latents as desired output, same shape as pred_x0
             latent_mask: Binary mask tensor, (B, 1, T', H', W') where 1=inside mask, 0=outside.
                 intermediate values indicate partial masking within the latent subpixel.
             optical_flow_mask: List of optical B flow mask tensors for the reference video (1, T-2, H, W)
                 these contain values either of [1.0, 1.5] or [0].
+        Returns:
+            Loss tensor (per batch element) shape (B,)
             
         Note that H' and W' are the latent dimensions, which are smaller than the original dimensions
         H and W due to downsampling in the VAE.
@@ -501,7 +542,7 @@ class SkyReelsA1V2VInpaintPipeline:
         Following the SkyReels-A1 paper, this loss is computed by:
         1. We first downsample the optical flow mask to (B, 1, T', H', W')
         2. We merge the latent_mask and optical_flow_mask by multiplying to create a combined mask M.
-        3. We then compute the total MSE loss between noise_pred and noise_gt, scaled by 
+        3. We then compute the total MSE loss between pred_x0 and target, scaled by 
               the combined mask M, and averaged over all latent pixels.
 
         We average over the _total_ number of pixels, following the definition of the face-aware
@@ -511,7 +552,7 @@ class SkyReelsA1V2VInpaintPipeline:
         """
 
         with torch.no_grad():
-            target_shape = noise_pred.shape[-3:]
+            target_shape = pred_x0.shape[-3:]
             optical_flow_mask = torch.stack(optical_flow_mask, dim=0)  # (B, 1, T-2, H, W)
             mask = torch.nn.functional.interpolate(
                 optical_flow_mask.float(),
@@ -525,6 +566,6 @@ class SkyReelsA1V2VInpaintPipeline:
             mask = torch.clamp(mask, min=0.1)
             combined_mask = mask * latent_mask.float()
 
-        loss = ((noise_pred.float() - noise_gt.float()) ** 2) * combined_mask
-        denom = loss.numel()  # average over all latent pixels, as described in the doc comment
-        return loss.sum() / denom
+        loss = ((pred_x0.float() - target.float()) ** 2) * combined_mask
+        denom = loss[0].numel()  # average over all latent pixels, as described in the doc comment
+        return loss.sum(dim=(1, 2, 3, 4)) / denom

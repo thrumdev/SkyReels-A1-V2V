@@ -117,6 +117,7 @@ class SkyReelsA1V2VInpaintPipeline:
 
         self.explicit_mask_channels = self.config.get("explicit_mask_channels", False)
         self.ref_frames_strength = self.config.get("ref_frames_strength", 0.01)
+        self.ref_frames_strength = min(0.0, max(1.0, self.ref_frames_strength))
 
         if self.explicit_mask_channels:
             self.transformer.patch_embed.expand_proj_channels(48 + 64) # Add the mask channels if necessary.

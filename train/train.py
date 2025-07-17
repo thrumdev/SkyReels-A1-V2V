@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 import tqdm
 
-from .dataloader import get_dataloader
+from .dataloader import get_dataloader, list_collate
 from .pipeline import SkyReelsA1V2VInpaintPipeline
 
 import wandb
@@ -94,7 +94,8 @@ class Trainer:
             config.data_dir, 
             config, 
         )
-        self.wandb_enabled = config.get("wandb_enabled", False)
+        self.inference_only = config.get("inference_only", False)
+        self.wandb_enabled = config.get("wandb_enabled", False) and not self.inference_only
 
         device = self.accelerator.device
         self.pipeline = SkyReelsA1V2VInpaintPipeline(config, device)
@@ -175,6 +176,7 @@ class Trainer:
                 config, 
                 mode="val", 
             )
+            self.inference_example = self.validation_dataloader.dataset[0]
             self.validation_dataloader = self.accelerator.prepare(self.validation_dataloader)
 
         # Gradient accumulation setup
@@ -379,7 +381,6 @@ class Trainer:
 
         self.pipeline.transformer.eval()
         val_losses = []
-        first_item = None
         with torch.no_grad():
             data = self.validation_dataloader
             if self.accelerator.is_main_process:
@@ -394,13 +395,6 @@ class Trainer:
                 num_train_timesteps = self.pipeline.scheduler.config.num_train_timesteps
                 timesteps = [torch.randint(0, num_train_timesteps, (1,), dtype=torch.long).item() for _ in range(len(ref_videos))]
 
-                if first_item is None:
-                    first_item = {
-                        "ref_video": ref_videos[0],
-                        "driving_video": driving_videos[0],
-                        "mask": masks[0],
-                        "identity_image": identity_images[0],
-                    }
                 loss, _, _ = self.pipeline.step_forward_and_loss(
                     ref_videos,
                     driving_videos,
@@ -421,42 +415,44 @@ class Trainer:
         gathered = gathered.cpu().numpy().tolist()
         avg_val_loss = sum(gathered) / len(gathered) if gathered else None
 
-        self.save_full_inference_example(step, first_item)
+        self.save_full_inference_example(f"step_{step}")
 
         self.pipeline.transformer.train()
 
         return avg_val_loss
     
     @torch.no_grad()
-    def save_full_inference_example(self, step, item):
+    def save_full_inference_example(self, name):
         if not self.accelerator.is_main_process:
             return
         
-        print(f"Saving full inference example for step {step}...")
+        batch = list_collate([self.inference_example])
+        ref_videos, driving_videos, masks, _,  identity_images = self.batch_to_device(batch)
+        height, width = ref_videos[0].shape[2], ref_videos[0].shape[3]
+        print(f"Saving full inference example ({name})...")
 
-        height, width = item["ref_video"].shape[2], item["ref_video"].shape[3]
         transformer = self.accelerator.unwrap_model(self.pipeline.transformer)
         output = self.pipeline.full_inference(
             transformer,
-            [item["ref_video"]],
-            [item["driving_video"]],
-            [item["mask"]],
-            [item["identity_image"]],
+            ref_videos,
+            driving_videos,
+            masks,
+            identity_images,
             height,
             width,
         ).squeeze(0).to(self.accelerator.device)
 
-        mask_grayscale = item["mask"].repeat(3, 1, 1, 1)  # Convert mask to 3-channel grayscale
+        mask_grayscale = masks[0].repeat(3, 1, 1, 1)  # Convert mask to 3-channel grayscale
 
         # Combine ref_video, output video, mask, landmarks in a H*2, W*2 grid.
-        top = torch.cat([item["ref_video"], output], dim=3)  # (C, T, H, W*2)
-        bottom = torch.cat([mask_grayscale, item["driving_video"]], dim=3)  # (C, T, H, W*2)
+        top = torch.cat([ref_videos[0], output], dim=3)  # (C, T, H, W*2)
+        bottom = torch.cat([mask_grayscale, driving_videos[0]], dim=3)  # (C, T, H, W*2)
         combined = torch.cat([top, bottom], dim=2).contiguous()  # (C, T, H*2, W*2)
 
         # If there are more than 20 files in the directory, remove the one with the smallest step number
         val_save_dir = self.config.get("val_save_dir", "denoised")
         os.makedirs(val_save_dir, exist_ok=True)
-        if len(os.listdir(val_save_dir)) > 20:
+        if name.starts_with("step_") and len(os.listdir(val_save_dir)) > 20:
             files = os.listdir(val_save_dir)
             files = [f for f in files if f.startswith("step_")]
             files.sort(key=lambda x: int(x.split("_")[1].split(".")[0]))
@@ -467,7 +463,7 @@ class Trainer:
 
         # Save the combined tensor as a video
         video = (combined.permute(1, 2, 3, 0).cpu().numpy() * 255).astype(np.uint8)  # (T, H*2, W*2, C)
-        save_path = os.path.join(val_save_dir, f"step_{step}.mp4")
+        save_path = os.path.join(val_save_dir, f"{name}.mp4")
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(save_path, fourcc, 16.0, (width*2, height*2))
         for frame in video:
@@ -514,8 +510,14 @@ def main():
     print("Loaded config:", config)
     trainer = Trainer(config)
 
-    final_step = trainer.train()
-    trainer.save(final_step)
+    if not trainer.inference_only:
+        final_step = trainer.train()
+        trainer.save(final_step)
+    else:
+        trainer.pipeline.transformer.eval()
+        name = config.get("inference_name", "out")
+        trainer.save_full_inference_example(name)
+        
 
 if __name__ == "__main__":
     main()

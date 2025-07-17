@@ -31,3 +31,5 @@ logit_normal_blend: 0.6
 #start_step: 0
 explicit_mask_channels: False
 ref_frames_strength: 1.0
+# inference_name: mp4_name
+# inference_only: true

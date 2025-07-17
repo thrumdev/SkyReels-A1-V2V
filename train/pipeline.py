@@ -232,9 +232,9 @@ class SkyReelsA1V2VInpaintPipeline:
             latent_masks: List of latent mask tensors (64, T', H', W')
             timesteps: List of timesteps
 
-        Returns model inputs (B, kC', T', H', W') and clean latents (B, C', T', H', W').
+        Returns model inputs (B, (k+64)C', T', H', W') and clean latents (B, C', T', H', W').
         The model inputs are concatenated along the channel dimension in the order:
-            [noisy_latent, lmk_latent, ref_latent, latent_mask] with k = 3 or 4 depending on
+            [noisy_latent, lmk_latent, ref_latent, latent_mask] with the +64 depending on
             whether `self.explicit_mask_channels` is set to True or False.
         """
 
@@ -300,6 +300,32 @@ class SkyReelsA1V2VInpaintPipeline:
         image_embeddings = self.siglip(**imgs).last_hidden_state  # torch.Size([B, 729, 1152])
 
         return image_embeddings.to(self.device, self.dtype)
+    
+    @torch.no_grad()
+    def masked_and_unmasked_pixels(self, pixel_masks):
+        """
+        Computes the number of masked pixels in each video.
+
+        Args:
+            pixel_masks: List of pixel mask tensors (1, T, H, W)
+
+        Returns:
+            A tuple of two tensors of shape (B,) where B is the number of videos.
+        """
+        masked_pixels = []
+        unmasked_pixels = []
+        for mask in pixel_masks:
+            h, w = mask.shape[2:]
+            size = h * w
+            count = mask.count_nonzero().item()
+            masked_pixels.append(count)
+            unmasked_pixels.append(size - count)
+
+        return (
+            torch.tensor(masked_pixels, device=self.device, dtype=torch.float32),
+            torch.tensor(unmasked_pixels, device=self.device, dtype=torch.float32)
+        )
+        
 
     def step_forward_and_loss(
         self, 
@@ -327,6 +353,7 @@ class SkyReelsA1V2VInpaintPipeline:
             frames: Number of frames in the input videos
         """
 
+        masked, unmasked = self.masked_and_unmasked_pixels(pixel_masks)
         latent_masks = self.prepare_masks(pixel_masks)
         model_inputs, clean_latents = self.prepare_latent(
             ref_videos, 
@@ -368,12 +395,13 @@ class SkyReelsA1V2VInpaintPipeline:
         err_std = (pred_x0.std(dim=(1, 2, 3, 4)) - target.std(dim=(1, 2, 3, 4))).abs().mean()
 
         latent_masks = self.flatten_latent_mask(latent_masks).to(self.device)
-        inpaint_loss = self.compute_inpaint_loss(pred_x0, target, latent_masks)
+        inpaint_loss = self.compute_inpaint_loss(pred_x0, target, latent_masks, unmasked)
         optical_flow_loss = self.compute_masked_optical_flow_loss(
             pred_x0,
             target,
             latent_masks,
             optical_flow_masks,
+            masked,
         )
 
         timestep_weights = self.timestep_weights(timesteps)
@@ -511,7 +539,7 @@ class SkyReelsA1V2VInpaintPipeline:
         latent_mask = torch.stack(latent_masks, dim=0)
         return latent_mask.mean(dim=1, keepdim=True)
 
-    def compute_inpaint_loss(self, pred_x0, target, latent_mask):
+    def compute_inpaint_loss(self, pred_x0, target, latent_mask, unmasked_pixels):
         """
         Computes the MSE loss between pred_x0 and target, but only for elements where latent_mask == 0 (i.e., outside the mask).
         Args:
@@ -519,15 +547,15 @@ class SkyReelsA1V2VInpaintPipeline:
             target: Clean latents as desired output, same shape as pred_x0
             latent_mask: Binary mask tensor, (B, 1, T', H', W') where 1=inside mask, 0=outside.
                 intermediate values indicate partial masking within the latent subpixel.
+            unmasked_pixels: Tensor (B,). The number of unmasked pixels in each element.
         Returns:
             Loss tensor (per batch element) shape (B,)
         """
         outside_mask = (1.0 - latent_mask).float()
         loss = ((pred_x0 - target) ** 2) * outside_mask
-        denom = outside_mask.sum(dim=(1, 2, 3, 4)) + 1e-8 # (B,)
-        return loss.sum(dim=(1, 2, 3, 4)) / denom
+        return loss.sum(dim=(1, 2, 3, 4)) / unmasked_pixels.float()
 
-    def compute_masked_optical_flow_loss(self, pred_x0, target, latent_mask, optical_flow_mask):
+    def compute_masked_optical_flow_loss(self, pred_x0, target, latent_mask, optical_flow_mask, masked_pixels):
         """
         Computes the masked optical flow loss between ref_video and gen_video, using pixel_mask 
         to filter out masked regions entirely.
@@ -539,6 +567,7 @@ class SkyReelsA1V2VInpaintPipeline:
                 intermediate values indicate partial masking within the latent subpixel.
             optical_flow_mask: List of optical B flow mask tensors for the reference video (1, T-2, H, W)
                 these contain values either of [1.0, 1.5] or [0].
+            masked_pixels: Tensor (B) the number of masked pixels in the video.
         Returns:
             Loss tensor (per batch element) shape (B,)
             
@@ -551,8 +580,8 @@ class SkyReelsA1V2VInpaintPipeline:
         3. We then compute the total MSE loss between pred_x0 and target, scaled by 
               the combined mask M, and averaged over all latent pixels.
 
-        We average over the _total_ number of pixels, following the definition of the face-aware
-        loss in the SkyReels-A1 paper (section 4.2) with a few modifications.
+        We average over the number of masked pixels, which diverges from the SkyReels paper
+        where they average over the total image size.
 
         Steps 1 and 2 are no_grad.
         """
@@ -573,5 +602,4 @@ class SkyReelsA1V2VInpaintPipeline:
             combined_mask = mask * latent_mask.float()
 
         loss = ((pred_x0.float() - target.float()) ** 2) * combined_mask
-        denom = loss[0].numel()  # average over all latent pixels, as described in the doc comment
-        return loss.sum(dim=(1, 2, 3, 4)) / denom
+        return loss.sum(dim=(1, 2, 3, 4)) / masked_pixels.float()

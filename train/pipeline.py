@@ -364,6 +364,9 @@ class SkyReelsA1V2VInpaintPipeline:
         pred_x0 = pred_x0.float()
         target = clean_latents.float()
 
+        err_mean = (pred_x0.mean(dim=(1, 2, 3, 4)) - target.mean(dim=(1, 2, 3, 4))).abs().mean()
+        err_std = (pred_x0.std(dim=(1, 2, 3, 4)) - target.std(dim=(1, 2, 3, 4))).abs().mean()
+
         latent_masks = self.flatten_latent_mask(latent_masks).to(self.device)
         inpaint_loss = self.compute_inpaint_loss(pred_x0, target, latent_masks)
         optical_flow_loss = self.compute_masked_optical_flow_loss(
@@ -373,32 +376,35 @@ class SkyReelsA1V2VInpaintPipeline:
             optical_flow_masks,
         )
 
-        inpaint_loss = self.timestep_weighted_loss(inpaint_loss, timesteps)
-        optical_flow_loss = self.timestep_weighted_loss(optical_flow_loss, timesteps)
+        timestep_weights = self.timestep_weights(timesteps)
+        inpaint_loss = (inpaint_loss * timestep_weights).mean()
+        optical_flow_loss = (optical_flow_loss * timestep_weights).mean()
         
         final_loss = self.config.get("inpaint_lambda", 1.0) * inpaint_loss + self.config.get("optical_flow_lambda", 1.0) * optical_flow_loss
 
-        # note: we need to weight the loss by timestep
-        # finetrainers uses 
-        # 1 / (1 - alphas_cumprod[timesteps])
-        # but for this we need to compute the losses separately per batch item
-        return final_loss, inpaint_loss.item(), optical_flow_loss.item()
-
-    def timestep_weighted_loss(self, losses, timesteps):
+        # all these are single-value tensors.
+        return {
+            "loss": final_loss,
+            "inpaint_loss": inpaint_loss,
+            "optical_flow_loss": optical_flow_loss,
+            "err_mean": err_mean,
+            "err_std": err_std,
+            "timestep_weights": timestep_weights.mean()
+        }
+    
+    def timestep_weights(self, timesteps):
         """
-        Computes the timestep weighted loss.
+        Computes the timestep weights for the given timesteps.
         Args:
-            losses: Tensor ([B]) of losses for each batch item.
             timesteps: List of timesteps for each batch item.
         Returns:
-            A tensor of the weighted loss.
+            A tensor of weights for each timestep.
         """
         alphas_cumprod = self.scheduler.alphas_cumprod
         # note: we copy from finetrainers `prepare_loss_weights` on the loss weighting
         # but they say "SNR is computed as (alphas / (1 - alphas)), but for some reason CogVideoX 
         # uses 1 / (1 - alphas). Experiment if using alphas / (1 - alphas) gives better results."
-        weights = 1 / (1 - alphas_cumprod[timesteps]) # (B,)
-        return torch.mean(losses * weights)
+        return 1 / (1 - alphas_cumprod[timesteps])
     
     @torch.no_grad()
     def full_inference(

@@ -233,7 +233,7 @@ class Trainer:
             blend=self.config.get("logit_normal_blend", 0.6)
         )
 
-        loss, inpaint_loss, optical_loss = self.pipeline.step_forward_and_loss(
+        log_dict = self.pipeline.step_forward_and_loss(
             ref_videos,
             driving_videos,
             masks,
@@ -243,9 +243,10 @@ class Trainer:
             height,
             width,
         )
+        loss = log_dict["loss"]
         loss = loss / self.gradient_accumulation_steps
         self.accelerator.backward(loss)
-        return loss.item(), inpaint_loss, optical_loss
+        return log_dict
     
     def init_pbar(self):
         if self.accelerator.is_main_process:
@@ -259,6 +260,23 @@ class Trainer:
         if self.accelerator.is_main_process:
             self.pbar.update(1)
 
+    def ingest_log_dict(self, log_dict):
+        if self.log_dict is None:
+            self.log_dict = { key: [val.item()] for key, val in log_dict.items() }
+        else:
+            for key, val in log_dict.items():
+                self.log_dict[key].append(val.item())
+
+    def gather_log_dict(self):
+        gathered_dict = {}
+        for key, values in sorted(self.log_dict.items()):
+            values = torch.tensor(values).to(self.accelerator.device)
+            gathered_values = self.accelerator.gather(values)
+            gathered_dict[key] = gathered_values.mean().item()
+        
+        self.log_dict = None
+        return gathered_dict
+
     def train(self):
         step = self.config.get("start_step", 0)
         max_steps = self.config.get("num_steps", 5000)
@@ -266,9 +284,6 @@ class Trainer:
         self.optimizer.zero_grad()
 
         self.init_pbar()
-        batch_losses = []
-        batch_inpaint_losses = []
-        batch_optical_losses = []
 
         fresh = True
         while True:
@@ -277,10 +292,8 @@ class Trainer:
                     print(f"Reached maximum training steps: {max_steps}. Stopping training.")
                     return max_steps
                 
-                final_loss, inpaint_loss, optical_loss = self.train_one_step(batch)
-                batch_losses.append(final_loss)
-                batch_inpaint_losses.append(inpaint_loss)
-                batch_optical_losses.append(optical_loss)
+                log_dict = self.train_one_step(batch)
+                self.ingest_log_dict(log_dict)
 
                 self._step_in_accum += 1
                 self.step_pbar()
@@ -290,30 +303,21 @@ class Trainer:
 
                     self.optimizer.zero_grad()
 
-                    batch_losses = torch.tensor(batch_losses, device=self.accelerator.device)
-                    batch_loss = self.accelerator.gather(batch_losses).mean().item()
-
-                    batch_inpaint_losses = torch.tensor(batch_inpaint_losses, device=self.accelerator.device)
-                    batch_inpaint_loss = self.accelerator.gather(batch_inpaint_losses).mean().item()
-
-                    batch_optical_losses = torch.tensor(batch_optical_losses, device=self.accelerator.device)
-                    batch_optical_loss = self.accelerator.gather(batch_optical_losses).mean().item()
+                    log_dict = self.gather_log_dict()
 
                     # Validation
                     avg_val_loss = None
                     if self.validation_steps and self.validation_steps > 0 and step % self.validation_steps == 0 and not fresh:
                         avg_val_loss = self.validate(step)
-                        
+
                     fresh = False
 
                     if self.config.wandb_enabled and self.accelerator.is_main_process:
                         wandb.log({
                             "step": step, 
-                            "loss": batch_loss, 
                             "val_loss": avg_val_loss, 
                             "grad_norm": grad_norm,
-                            "inpaint_loss": batch_inpaint_loss,
-                            "optical_loss": batch_optical_loss,
+                            **log_dict,
                         })
 
                     step += 1
@@ -402,7 +406,7 @@ class Trainer:
                     blend=self.config.get("logit_normal_blend", 0.6)
                 )
 
-                loss, _, _ = self.pipeline.step_forward_and_loss(
+                log_dict = self.pipeline.step_forward_and_loss(
                     ref_videos,
                     driving_videos,
                     masks,
@@ -414,7 +418,7 @@ class Trainer:
                 )
 
                 # division here is for consistency with training loss.
-                val_losses.append(loss.cpu().item() / self.gradient_accumulation_steps)
+                val_losses.append(log_dict["loss"].cpu().item() / self.gradient_accumulation_steps)
 
         # Gather losses from all processes
         loss_tensor = torch.tensor(val_losses, device="cpu").to(self.accelerator.device)

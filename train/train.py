@@ -454,7 +454,7 @@ class Trainer:
         # If there are more than 20 files in the directory, remove the one with the smallest step number
         val_save_dir = self.config.get("val_save_dir", "denoised")
         os.makedirs(val_save_dir, exist_ok=True)
-        if name.starts_with("step_") and len(os.listdir(val_save_dir)) > 20:
+        if name.startswith("step_") and len(os.listdir(val_save_dir)) > 20:
             files = os.listdir(val_save_dir)
             files = [f for f in files if f.startswith("step_")]
             files.sort(key=lambda x: int(x.split("_")[1].split(".")[0]))

@@ -214,6 +214,24 @@ class SkyReelsA1V2VInpaintPipeline:
         return result_masks
     
     @torch.no_grad()
+    def dropout_ref_frames(self, ref_videos):
+        """
+        Drop out a random number of the early conditioning frames.
+
+        This forces the model, while training, to pay attention to the later conditioning.
+        """
+
+        if self.transformer.training:
+            max_dropout = self.config.get("max_ref_dropout_frames", 20)
+            dropout = torch.randint(0, max_dropout + 1, (ref_videos.shape[0],), device=self.device)
+            # use dropout to drop the first `dropout` frames in each video
+            for i, d in enumerate(dropout):
+                if d > 0:
+                    ref_videos[i, :, 0:d, :, :] = 0.0
+
+        return ref_videos
+    
+    @torch.no_grad()
     def prepare_latent(
         self, 
         ref_videos, 
@@ -269,8 +287,7 @@ class SkyReelsA1V2VInpaintPipeline:
         pixel_mask = pixel_masks[:, :, 1:, :, :]
         ref_videos[:, :, 1:, :, :] *= (1.0 - pixel_mask)
 
-        # Apply darkening to the reference frames (after first)
-        ref_videos[:, :, 1:, :, :] *= self.ref_frames_strength
+        ref_videos = self.dropout_ref_frames(ref_videos)
         ref_latent = self.vae.encode(ref_videos).latent_dist.sample() * self.vae_scaling_factor_image
 
         lmk_latent = self.lmk_encoder.encode(driving_videos).latent_dist.mode()

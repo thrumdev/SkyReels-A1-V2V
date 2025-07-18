@@ -118,6 +118,7 @@ class SkyReelsA1V2VInpaintPipeline:
         self.explicit_mask_channels = self.config.get("explicit_mask_channels", False)
         self.ref_frames_strength = self.config.get("ref_frames_strength", 0.01)
         self.ref_frames_strength = min(0.0, max(1.0, self.ref_frames_strength))
+        self.clamp_timestep_weight = self.config.get("clamp_timestep_weight", 10000.0)
 
         if self.explicit_mask_channels:
             self.transformer.patch_embed.expand_proj_channels(48 + 64) # Add the mask channels if necessary.
@@ -402,7 +403,7 @@ class SkyReelsA1V2VInpaintPipeline:
             optical_flow_masks,
         )
 
-        timestep_weights = self.timestep_weights(timesteps)
+        timestep_weights = self.timestep_weights(timesteps).clamp(self.clamp_timestep_weight)
         final_loss = (loss * timestep_weights).mean()
 
         # TODO: remove these when they are no longer needed by logging.

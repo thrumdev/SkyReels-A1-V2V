@@ -33,3 +33,4 @@ explicit_mask_channels: False
 ref_frames_strength: 1.0
 # inference_name: mp4_name
 # inference_only: true
+clamp_timestep_weight: 2.5

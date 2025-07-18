@@ -583,7 +583,6 @@ class SkyReelsA1V2VInpaintPipeline:
             Loss tensor (per batch element) shape (B,)
         """
         with torch.no_grad():
-
             # We first downsample the optical flow mask to (B, 1, T', H', W')
             target_shape = pred_x0.shape[-3:]
             optical_flow_mask = torch.stack(optical_flow_mask, dim=0)  # (B, 1, T-2, H, W)
@@ -601,6 +600,22 @@ class SkyReelsA1V2VInpaintPipeline:
             # note: latent pixels which are partially masked (have intermediate values in latent_mask)
             # will have a min weight that's blended between 0.333 and 0.5
             weight = outside_weight + inside_weight
+
+            frame_loss_scaling = self.config.get("frame_loss_scaling", 0.05)
+
+            if frame_loss_scaling > 0.0:
+                # create a tensor, shape (B, 1, T', H', W') where all the items for frame t
+                # have value 1.0 + t * frame_loss_scaling
+                frame_weights = torch.arange(
+                    1.0,
+                    1.0 + frame_loss_scaling * pred_x0.shape[2],
+                    step=frame_loss_scaling,
+                    device=pred_x0.device,
+                    dtype=pred_x0.dtype
+                ).view(1, 1, -1, 1, 1) # (1, 1, T', 1, 1)
+
+                # Scale the frame weights by the frame factor.
+                weight = weight * frame_weights
         
         # Compute the MSE loss scaled by the weight.
         loss = ((pred_x0 - target) ** 2) * weight

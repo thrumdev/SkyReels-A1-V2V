@@ -33,3 +33,4 @@ explicit_mask_channels: False
 # inference_only: true
 clamp_timestep_weight: 2.5
 max_ref_dropout_frames: 20
+frame_loss_scaling: 0.3

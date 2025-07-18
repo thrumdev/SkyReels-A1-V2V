@@ -223,7 +223,14 @@ class SkyReelsA1V2VInpaintPipeline:
 
         if self.transformer.training:
             max_dropout = self.config.get("max_ref_dropout_frames", 20)
-            dropout = torch.randint(0, max_dropout + 1, (ref_videos.shape[0],), device=self.device)
+            dropout_prob = self.config.get("ref_dropout_rate", 0.7)
+
+            dropout_probs = torch.rand(ref_videos.shape[0], device=self.device) < dropout_prob
+            dropout = torch.randint(1, max_dropout + 1, (ref_videos.shape[0],), device=self.device)
+
+            # only apply dropout to the videos with the right dropout probability.
+            dropout = dropout * dropout_probs
+
             # use dropout to drop the first `dropout` frames in each video
             for i, d in enumerate(dropout):
                 if d > 0:

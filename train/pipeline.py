@@ -428,7 +428,7 @@ class SkyReelsA1V2VInpaintPipeline:
             delta_x0,
             delta_target,
             latent_masks[:, :, 1:, :, :],
-            optical_flow_masks[:, :, 1:, :, :],
+            [mask[:, 1:, :, :] for mask in optical_flow_masks],
         )
 
         timestep_weights = self.timestep_weights(timesteps).clamp(self.clamp_timestep_weight)
@@ -606,10 +606,10 @@ class SkyReelsA1V2VInpaintPipeline:
             if frame_loss_scaling > 0.0:
                 # create a tensor, shape (B, 1, T', H', W') where all the items for frame t
                 # have value 1.0 + t * frame_loss_scaling
-                frame_weights = torch.arange(
+                frame_weights = torch.linspace(
                     1.0,
-                    1.0 + frame_loss_scaling * pred_x0.shape[2],
-                    step=frame_loss_scaling,
+                    1.0 + frame_loss_scaling * (pred_x0.shape[2] - 1),
+                    steps=pred_x0.shape[2],
                     device=pred_x0.device,
                     dtype=pred_x0.dtype
                 ).view(1, 1, -1, 1, 1) # (1, 1, T', 1, 1)

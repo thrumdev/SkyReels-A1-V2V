@@ -315,8 +315,8 @@ class SkyReelsA1V2VInpaintPipeline:
         masked_pixels = []
         unmasked_pixels = []
         for mask in pixel_masks:
-            h, w = mask.shape[2:]
-            size = h * w
+            t, h, w = mask.shape[1:]
+            size = t * h * w
             count = mask.count_nonzero().item()
             masked_pixels.append(count)
             unmasked_pixels.append(size - count)
@@ -395,20 +395,19 @@ class SkyReelsA1V2VInpaintPipeline:
         err_std = (pred_x0.std(dim=(1, 2, 3, 4)) - target.std(dim=(1, 2, 3, 4))).abs().mean()
 
         latent_masks = self.flatten_latent_mask(latent_masks).to(self.device)
-        inpaint_loss = self.compute_inpaint_loss(pred_x0, target, latent_masks, unmasked)
-        optical_flow_loss = self.compute_masked_optical_flow_loss(
+        loss = self.compute_optical_flow_face_weighted_loss(
             pred_x0,
             target,
             latent_masks,
             optical_flow_masks,
-            masked,
         )
 
         timestep_weights = self.timestep_weights(timesteps)
-        inpaint_loss = (inpaint_loss * timestep_weights).mean()
-        optical_flow_loss = (optical_flow_loss * timestep_weights).mean()
-        
-        final_loss = self.config.get("inpaint_lambda", 1.0) * inpaint_loss + self.config.get("optical_flow_lambda", 1.0) * optical_flow_loss
+        final_loss = (loss * timestep_weights).mean()
+
+        # TODO: remove these when they are no longer needed by logging.
+        inpaint_loss = torch.tensor(0)
+        optical_flow_loss = torch.tensor(0)
 
         # all these are single-value tensors.
         return {
@@ -538,6 +537,48 @@ class SkyReelsA1V2VInpaintPipeline:
 
         latent_mask = torch.stack(latent_masks, dim=0)
         return latent_mask.mean(dim=1, keepdim=True)
+
+    def compute_optical_flow_face_weighted_loss(self, pred_x0, target, latent_mask, optical_flow_mask):
+        """
+        Computes an MSE loss between pred_x0 and target, and scales it by the optical flow mask.
+        Within the face region, we set a minimum scaling factor of 0.5, and outside of the face
+        region we set it to 0.333
+        Args:
+            pred_x0: Predicted latent output (B, C, T', H', W')
+            target: Clean latents as desired output, same shape as pred_x0
+            latent_mask: Binary mask tensor, (B, 1, T', H', W') where 1=inside mask, 0=outside.
+                intermediate values indicate partial masking within the latent subpixel.
+            optical_flow_mask: List of optical B flow mask tensors for the reference video (1, T-2, H, W)
+                these contain values either of [1.0, 1.5] or [0].
+        Returns:
+            Loss tensor (per batch element) shape (B,)
+        """
+        with torch.no_grad():
+
+            # We first downsample the optical flow mask to (B, 1, T', H', W')
+            target_shape = pred_x0.shape[-3:]
+            optical_flow_mask = torch.stack(optical_flow_mask, dim=0)  # (B, 1, T-2, H, W)
+            optical_weight = torch.nn.functional.interpolate(
+                optical_flow_mask.float(),
+                size=target_shape,
+                mode='trilinear',
+                align_corners=False
+            )
+
+            outside_mask = (1.0 - latent_mask).float()
+            outside_weight = (optical_weight.clamp(min=0.5) * outside_mask)
+            inside_weight = (optical_weight.clamp(min=0.333) * latent_mask.float())
+
+            # note: latent pixels which are partially masked (have intermediate values in latent_mask)
+            # will have a min weight that's blended between 0.333 and 0.5
+            weight = outside_weight + inside_weight
+        
+        # Compute the MSE loss scaled by the weight.
+        loss = ((pred_x0 - target) ** 2) * weight
+        # Total number of elements in the latent space (C', T', H', W') per batch item
+        size = pred_x0[0].numel()  
+        return loss.sum(dim=(1, 2, 3, 4)) / size
+
 
     def compute_inpaint_loss(self, pred_x0, target, latent_mask, unmasked_pixels):
         """

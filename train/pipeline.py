@@ -438,7 +438,7 @@ class SkyReelsA1V2VInpaintPipeline:
             [mask[:, 1:, :, :] for mask in optical_flow_masks],
         )
 
-        timestep_weights = self.timestep_weights(timesteps).clamp(self.clamp_timestep_weight)
+        timestep_weights = self.timestep_weights(timesteps).clamp(max=self.clamp_timestep_weight)
         pixel_loss = (pixel_loss * timestep_weights).mean()
         delta_loss = (delta_loss * timestep_weights).mean()
 

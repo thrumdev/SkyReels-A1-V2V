@@ -396,25 +396,36 @@ class SkyReelsA1V2VInpaintPipeline:
         err_std = (pred_x0.std(dim=(1, 2, 3, 4)) - target.std(dim=(1, 2, 3, 4))).abs().mean()
 
         latent_masks = self.flatten_latent_mask(latent_masks).to(self.device)
-        loss = self.compute_optical_flow_face_weighted_loss(
+        pixel_loss = self.compute_optical_flow_face_weighted_loss(
             pred_x0,
             target,
             latent_masks,
             optical_flow_masks,
         )
 
-        timestep_weights = self.timestep_weights(timesteps).clamp(self.clamp_timestep_weight)
-        final_loss = (loss * timestep_weights).mean()
+        # compute delta at each frame.
+        delta_x0 = pred_x0[:, :, 1:, :, :] - pred_x0[:, :, :-1, :, :]
+        delta_target = target[:, :, 1:, :, :] - target[:, :, :-1, :, :]
 
-        # TODO: remove these when they are no longer needed by logging.
-        inpaint_loss = torch.tensor(0)
-        optical_flow_loss = torch.tensor(0)
+        delta_loss = self.compute_optical_flow_face_weighted_loss(
+            delta_x0,
+            delta_target,
+            latent_masks[:, :, 1:, :, :],
+            optical_flow_masks[:, :, 1:, :, :],
+        )
+
+        timestep_weights = self.timestep_weights(timesteps).clamp(self.clamp_timestep_weight)
+        pixel_loss = (pixel_loss * timestep_weights).mean()
+        delta_loss = (delta_loss * timestep_weights).mean()
+
+        delta_loss_lambda = self.config.get("delta_loss_lambda", 0.333)
+        final_loss = pixel_loss + delta_loss_lambda * delta_loss
 
         # all these are single-value tensors.
         return {
             "loss": final_loss,
-            "inpaint_loss": inpaint_loss,
-            "optical_flow_loss": optical_flow_loss,
+            "pixel_loss": pixel_loss,
+            "delta_loss": delta_loss,
             "err_mean": err_mean,
             "err_std": err_std,
             "timestep_weights": timestep_weights.mean()
@@ -567,8 +578,8 @@ class SkyReelsA1V2VInpaintPipeline:
             )
 
             outside_mask = (1.0 - latent_mask).float()
-            outside_weight = (optical_weight.clamp(min=0.5) * outside_mask)
-            inside_weight = (optical_weight.clamp(min=0.333) * latent_mask.float())
+            outside_weight = (optical_weight.clamp(min=0.333) * outside_mask)
+            inside_weight = (optical_weight.clamp(min=0.500) * latent_mask.float())
 
             # note: latent pixels which are partially masked (have intermediate values in latent_mask)
             # will have a min weight that's blended between 0.333 and 0.5

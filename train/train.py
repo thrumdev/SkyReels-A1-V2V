@@ -185,9 +185,11 @@ class Trainer:
         self._step_in_accum = 0
 
         if self.wandb_enabled and self.accelerator.is_main_process:
+            config_dict = OmegaConf.to_container(config, resolve=True)
             wandb.init(
                 project=config.get("wandb_project", "skyreels-a1-v2v"),
                 name=config.get("wandb_name", None),
+                config=config_dict,
             )
 
             # make wandb graph catch up.

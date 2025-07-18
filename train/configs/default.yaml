@@ -16,7 +16,6 @@ data_dir: "data/train"
 model_path: pretrained_models/SkyReels-A1-5B
 siglip_path: pretrained_models/SkyReels-A1-5B/siglip-so400m-patch14-384
 dtype: bfloat16
-delta_loss_lambda: 0.333
 max_mask_expand: 10
 validation_steps: 1000
 validation_data_dir: 'data/val'
@@ -33,4 +32,5 @@ explicit_mask_channels: False
 # inference_only: true
 clamp_timestep_weight: 2.5
 max_ref_dropout_frames: 20
-frame_loss_scaling: 0.3
+frame_loss_scaling: 0.05
+delta_loss_lambda: 0.333

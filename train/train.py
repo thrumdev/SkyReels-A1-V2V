@@ -44,6 +44,50 @@ def expand_mask(mask, expand_x, expand_y):
 
     return expanded_mask
 
+@torch.no_grad()
+def mask_shape_best_fit(mask):
+    x = torch.rand((1,)).item()
+
+    T, H, W = mask.shape[1:]
+    if x < 0.333:
+        # Make each frame of the mask store the rectangle of best fit for the mask.
+        for t in range(T):
+            frame = mask[0, t]
+            nonzero = torch.nonzero(frame) # returns (n_nonzero, 2) tensor of y, x coords
+            if nonzero.numel() == 0 or nonzero.shape[0] == frame.numel():
+                continue
+
+            y_min, x_min = nonzero.min(dim=0).values
+            y_max, x_max = nonzero.max(dim=0).values
+            rect = torch.zeros_like(frame)
+            rect[y_min:y_max + 1, x_min:x_max + 1] = 1.0
+            mask[0, t] = rect
+        
+        return mask
+    elif x < 0.5:
+        # Make each frame of the mask store the circle of best fit for the mask.
+        for t in range(T):
+            frame = mask[0, t]
+            nonzero = torch.nonzero(frame) # returns (n_nonzero, 2) tensor of y, x coords
+            if nonzero.numel() == 0 or nonzero.shape[0] == frame.numel():
+                continue
+
+            center = nonzero.float().mean(dim=0)  # (y, x)
+            # Compute distances from center to each masked pixel
+            dists = torch.norm(nonzero.float() - center, dim=1)
+            radius = dists.max().item()
+
+            # Create a grid of coordinates
+            y = torch.arange(H, device=frame.device).view(-1, 1)
+            x = torch.arange(W, device=frame.device).view(1, -1)
+            dist_grid = torch.sqrt((y - center[0]) ** 2 + (x - center[1]) ** 2)
+            circle = (dist_grid <= radius).float()
+            mask[0, t] = circle
+        
+        return mask
+    else:
+        return mask
+
 def trim_batch_items(ref_videos, driving_videos, masks, optical_flow_masks, frames):
     """
     Trims/prunes each item in the batch to a random slice of 'frames' frames.

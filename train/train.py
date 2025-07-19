@@ -177,7 +177,8 @@ class Trainer:
                 config, 
                 mode="val", 
             )
-            self.inference_example = self.validation_dataloader.dataset[0]
+            inference_index = self.config.get("inference_index", 0)
+            self.inference_example = self.validation_dataloader.dataset[inference_index]
             self.validation_dataloader = self.accelerator.prepare(self.validation_dataloader)
 
         # Gradient accumulation setup

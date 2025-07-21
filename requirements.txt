@@ -22,6 +22,7 @@ mediapipe==0.10.21
 librosa==0.10.2.post1
 onnxruntime-gpu==1.16.3
 accelerate==1.6.0
+lpips>=0.1.4
 
 # if torch or pytorch3d installation fails, try:
 # pip install torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cu118

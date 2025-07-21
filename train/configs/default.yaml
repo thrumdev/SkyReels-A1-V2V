@@ -27,7 +27,7 @@ compile: false
 logit_normal_blend: 0.6
 #restore_checkpoint: /path/to/checkpoint
 #start_step: 0
-explicit_mask_channels: False
+explicit_mask_channels: true
 # inference_name: mp4_name
 # inference_only: true
 # inference_index: 0
@@ -36,3 +36,8 @@ ref_dropout_rate: 0.7
 max_ref_dropout_frames: 20
 frame_loss_scaling: 0.05
 delta_loss_lambda: 0.333
+pixel_loss_lambda: 0.1
+lpips_loss_lambda: 0.1
+total_loss_scaling: 1.0
+grow_bbox_by: 0.08
+log_components: false

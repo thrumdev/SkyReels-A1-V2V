@@ -184,6 +184,9 @@ class Trainer:
             # this take a module parameter (not used) and then value as a kwarg
             self.pipeline.transformer._set_gradient_checkpointing("", value=True)
 
+            # This will enable for encode and decode, but all encode calls are in no_grad
+            self.pipeline.vae._set_gradient_checkpointing()
+
         for name, param in self.pipeline.transformer.named_parameters():
             if param.requires_grad and self.accelerator.is_main_process:
                 print(f"Trainable parameter: {name} - {param.shape}")
@@ -353,6 +356,10 @@ class Trainer:
                     self.optimizer.zero_grad()
 
                     log_dict = self.gather_log_dict()
+
+                    if self.accelerator.is_main_process and self.config.get("log_components", False):
+                        for name, value in log_dict.items():
+                            print(f"{name}: {value:.4f}")
 
                     # Validation
                     avg_val_loss = None

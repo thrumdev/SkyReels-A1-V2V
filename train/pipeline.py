@@ -9,6 +9,8 @@ from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 from einops import rearrange
 from tqdm import tqdm
 
+import lpips
+
 from typing import Tuple
 import inspect
 
@@ -153,6 +155,8 @@ class SkyReelsA1V2VInpaintPipeline:
         self.siglip = SiglipVisionModel.from_pretrained(siglip_name).to(device, self.dtype)
         self.siglip_normalize = SiglipImageProcessor.from_pretrained(siglip_name)
         self.t_config = self.transformer.config
+
+        self.lpips_loss = lpips.LPIPS(net='vgg').to(device, self.dtype)
 
     # Copied from diffusers.pipelines.cogvideo.pipeline_cogvideox.CogVideoXPipeline._prepare_rotary_positional_embeddings
     @torch.no_grad()
@@ -325,32 +329,6 @@ class SkyReelsA1V2VInpaintPipeline:
         image_embeddings = self.siglip(**imgs).last_hidden_state  # torch.Size([B, 729, 1152])
 
         return image_embeddings.to(self.device, self.dtype)
-    
-    @torch.no_grad()
-    def masked_and_unmasked_pixels(self, pixel_masks):
-        """
-        Computes the number of masked pixels in each video.
-
-        Args:
-            pixel_masks: List of pixel mask tensors (1, T, H, W)
-
-        Returns:
-            A tuple of two tensors of shape (B,) where B is the number of videos.
-        """
-        masked_pixels = []
-        unmasked_pixels = []
-        for mask in pixel_masks:
-            t, h, w = mask.shape[1:]
-            size = t * h * w
-            count = mask.count_nonzero().item()
-            masked_pixels.append(count)
-            unmasked_pixels.append(size - count)
-
-        return (
-            torch.tensor(masked_pixels, device=self.device, dtype=torch.float32),
-            torch.tensor(unmasked_pixels, device=self.device, dtype=torch.float32)
-        )
-        
 
     def step_forward_and_loss(
         self, 
@@ -378,7 +356,6 @@ class SkyReelsA1V2VInpaintPipeline:
             frames: Number of frames in the input videos
         """
 
-        masked, unmasked = self.masked_and_unmasked_pixels(pixel_masks)
         latent_masks = self.prepare_masks(pixel_masks)
         model_inputs, clean_latents = self.prepare_latent(
             ref_videos, 
@@ -419,8 +396,13 @@ class SkyReelsA1V2VInpaintPipeline:
         err_mean = (pred_x0.mean(dim=(1, 2, 3, 4)) - target.mean(dim=(1, 2, 3, 4))).abs().mean()
         err_std = (pred_x0.std(dim=(1, 2, 3, 4)) - target.std(dim=(1, 2, 3, 4))).abs().mean()
 
+        delta_loss_lambda = self.config.get("delta_loss_lambda", 0.333)
+        pixel_loss_lambda = self.config.get("pixel_loss_lambda", 0.1)
+        lpips_loss_lambda = self.config.get("lpips_loss_lambda", 0.1)
+        total_loss_scaling = self.config.get("total_loss_scaling", 1.0)
+
         latent_masks = self.flatten_latent_mask(latent_masks).to(self.device)
-        pixel_loss = self.compute_optical_flow_face_weighted_loss(
+        lpixel_loss = self.compute_optical_flow_face_weighted_loss(
             pred_x0,
             target,
             latent_masks,
@@ -438,22 +420,45 @@ class SkyReelsA1V2VInpaintPipeline:
             [mask[:, 1:, :, :] for mask in optical_flow_masks],
         )
 
-        timestep_weights = self.timestep_weights(timesteps).clamp(max=self.clamp_timestep_weight)
-        pixel_loss = (pixel_loss * timestep_weights).mean()
-        delta_loss = (delta_loss * timestep_weights).mean()
+        pred_x0_scaled = pred_x0 * (1 / self.vae_scaling_factor_image)
+        pred_decoded = self.vae.decode(pred_x0_scaled).sample
 
-        delta_loss_lambda = self.config.get("delta_loss_lambda", 0.333)
-        final_loss = pixel_loss + delta_loss_lambda * delta_loss
+        target_decoded = torch.stack(ref_videos, dim=0) * 2.0 - 1.0  # Normalize to [-1, 1]
+        pixel_masks = torch.stack(pixel_masks, dim=0)  # (B, 1, T, H, W)
+
+        pixel_loss = self.compute_optical_flow_face_weighted_loss(
+            pred_decoded,
+            target_decoded,
+            pixel_masks,
+            optical_flow_masks,
+            is_pixel=True,
+        )
+
+        lpips_loss = self.compute_cropped_lpips_loss(pred_decoded, target_decoded, pixel_masks)
+
+        timestep_weights = self.timestep_weights(timesteps).clamp(max=self.clamp_timestep_weight)
+
+        lpixel_loss = (lpixel_loss * timestep_weights).mean()
+        delta_loss = delta_loss_lambda * (delta_loss * timestep_weights).mean()
+        pixel_loss = pixel_loss_lambda * (pixel_loss * timestep_weights).mean()
+        lpips_loss = lpips_loss_lambda * (lpips_loss * timestep_weights).mean()
+
+        final_loss = lpixel_loss + delta_loss + pixel_loss + lpips_loss
+        final_loss = final_loss * total_loss_scaling
 
         # all these are single-value tensors.
-        return {
+        log_dict = {
             "loss": final_loss,
+            "lpixel_loss": lpixel_loss,
             "pixel_loss": pixel_loss,
+            "lpips_loss": lpips_loss,
             "delta_loss": delta_loss,
             "err_mean": err_mean,
             "err_std": err_std,
             "timestep_weights": timestep_weights.mean()
         }
+
+        return log_dict
     
     def timestep_weights(self, timesteps):
         """
@@ -574,7 +579,14 @@ class SkyReelsA1V2VInpaintPipeline:
         latent_mask = torch.stack(latent_masks, dim=0)
         return latent_mask.mean(dim=1, keepdim=True)
 
-    def compute_optical_flow_face_weighted_loss(self, pred_x0, target, latent_mask, optical_flow_mask):
+    def compute_optical_flow_face_weighted_loss(
+        self, 
+        pred_x0, 
+        target, 
+        latent_mask, 
+        optical_flow_mask,
+        is_pixel=False,
+    ):
         """
         Computes an MSE loss between pred_x0 and target, and scales it by the optical flow mask.
         Within the face region, we set a minimum scaling factor of 0.5, and outside of the face
@@ -609,6 +621,8 @@ class SkyReelsA1V2VInpaintPipeline:
             weight = outside_weight + inside_weight
 
             frame_loss_scaling = self.config.get("frame_loss_scaling", 0.05)
+            if is_pixel:
+                frame_loss_scaling = frame_loss_scaling / 4.0
 
             if frame_loss_scaling > 0.0:
                 # create a tensor, shape (B, 1, T', H', W') where all the items for frame t
@@ -626,72 +640,123 @@ class SkyReelsA1V2VInpaintPipeline:
         
         # Compute the MSE loss scaled by the weight.
         loss = ((pred_x0 - target) ** 2) * weight
-        # Total number of elements in the latent space (C', T', H', W') per batch item
+        # Total number of elements in the space (C', T', H', W') per batch item
         size = pred_x0[0].numel()  
         return loss.sum(dim=(1, 2, 3, 4)) / size
-
-
-    def compute_inpaint_loss(self, pred_x0, target, latent_mask, unmasked_pixels):
+    
+    @torch.no_grad()
+    def find_mask_bounding_box(self, pixel_masks):
         """
-        Computes the MSE loss between pred_x0 and target, but only for elements where latent_mask == 0 (i.e., outside the mask).
-        Args:
-            pred_x0: Predicted latent output (B, C, T', H', W')
-            target: Clean latents as desired output, same shape as pred_x0
-            latent_mask: Binary mask tensor, (B, 1, T', H', W') where 1=inside mask, 0=outside.
-                intermediate values indicate partial masking within the latent subpixel.
-            unmasked_pixels: Tensor (B,). The number of unmasked pixels in each element.
-        Returns:
-            Loss tensor (per batch element) shape (B,)
-        """
-        outside_mask = (1.0 - latent_mask).float()
-        loss = ((pred_x0 - target) ** 2) * outside_mask
-        return loss.sum(dim=(1, 2, 3, 4)) / unmasked_pixels.float()
+        Computes a moving bounding box for the pixel masks.
 
-    def compute_masked_optical_flow_loss(self, pred_x0, target, latent_mask, optical_flow_mask, masked_pixels):
-        """
-        Computes the masked optical flow loss between ref_video and gen_video, using pixel_mask 
-        to filter out masked regions entirely.
+        For each batch item, this computes the minimum bounding box size that contains all masked
+        pixels in each frame, as well as the center of that bounding box (may be negative)
+        for each frame.
 
         Args:
-            pred_x0: Predicted latent output (B, C, T', H', W')
-            target: Clean latents as desired output, same shape as pred_x0
-            latent_mask: Binary mask tensor, (B, 1, T', H', W') where 1=inside mask, 0=outside.
-                intermediate values indicate partial masking within the latent subpixel.
-            optical_flow_mask: List of optical B flow mask tensors for the reference video (1, T-2, H, W)
-                these contain values either of [1.0, 1.5] or [0].
-            masked_pixels: Tensor (B) the number of masked pixels in the video.
+            pixel_masks: Pixel masks for reference videos (B, 1, T, H, W)
         Returns:
-            Loss tensor (per batch element) shape (B,)
-            
-        Note that H' and W' are the latent dimensions, which are smaller than the original dimensions
-        H and W due to downsampling in the VAE.
+            A tuple of two tensors: 
+            - the first is [B, 2], which contains the H, W dimensions of the bounding box for each batch item.
+            - the second is [B, T, 2], which contains the center (y, x) of the bounding box
+              for each frame in each batch item.              
+        """
+        B, _, T, H, W = pixel_masks.shape
+        max_bbox_sizes = []
+        all_centers = []
 
-        Following the SkyReels-A1 paper, this loss is computed by:
-        1. We first downsample the optical flow mask to (B, 1, T', H', W')
-        2. We merge the latent_mask and optical_flow_mask by multiplying to create a combined mask M.
-        3. We then compute the total MSE loss between pred_x0 and target, scaled by 
-              the combined mask M, and averaged over all latent pixels.
+        grow_bbox_by = self.config.get("grow_bbox_by", 0.1)
 
-        We average over the number of masked pixels, which diverges from the SkyReels paper
-        where they average over the total image size.
+        for b in range(B):
+            bbox_sizes = []
+            centers = []
+            for t in range(T):
+                frame = pixel_masks[b, 0, t]  # (H, W)
+                nonzero = torch.nonzero(frame)
+                if nonzero.numel() == 0 or nonzero.numel() == frame.numel():
+                    # No mask: top-left (-1, -1), size (0, 0)
+                    # or masking full frame (this happens when no face detected)
+                    centers.append(torch.tensor([-1, -1], device=frame.device))
+                    bbox_sizes.append(torch.tensor([0, 0], device=frame.device))
+                else:
+                    y_min, x_min = nonzero.min(dim=0).values
+                    y_max, x_max = nonzero.max(dim=0).values
+                    centers.append(torch.stack([(y_max + y_min)//2, (x_max + x_min)//2]))
+                    bbox_sizes.append(torch.stack([y_max - y_min + 1, x_max - x_min + 1]))
+            # Max bbox size across all frames for this batch item
+            bbox_sizes_tensor = torch.stack(bbox_sizes)  # (T, 2)
+            max_size = bbox_sizes_tensor.max(dim=0).values  # (2,)
+            max_bbox_sizes.append(max_size * (1 + grow_bbox_by))
+            all_centers.append(torch.stack(centers))  # (T, 2)
 
-        Steps 1 and 2 are no_grad.
+        max_bbox_sizes = torch.stack(max_bbox_sizes, device=pixel_masks.device)  # (B, 2)
+        all_centers = torch.stack(all_centers, device=pixel_masks.device)  # (B, T, 2)
+        return max_bbox_sizes, all_centers
+
+    def compute_cropped_lpips_loss(self, pred_decoded, target_decoded, pixel_masks):
+        """
+        Computes the LPIPS loss between the predicted and target decoded videos, cropped by the pixel masks.
+        This will invoke LPIPS for each batch item, cropping each frame to a bounding box that covers
+        the face mask, grown by a configurable factor.
+
+        Args:
+            pred_decoded: Predicted decoded videos (B, C, T, H, W)
+            target_decoded: Target decoded videos (B, C, T, H, W)
+            pixel_masks: Pixel masks for the reference video (B, 1, T, H, W)
+        Returns:
+            LPIPS loss tensor (per batch element) shape (B,)
         """
 
-        with torch.no_grad():
-            target_shape = pred_x0.shape[-3:]
-            optical_flow_mask = torch.stack(optical_flow_mask, dim=0)  # (B, 1, T-2, H, W)
-            mask = torch.nn.functional.interpolate(
-                optical_flow_mask.float(),
-                size=target_shape,
-                mode='trilinear',
-                align_corners=False
+        bbox_sizes, all_bbox_centers = self.find_mask_bounding_box(pixel_masks)
+
+        lpips_losses = []
+        for b, (bbox_size, bbox_centers) in enumerate(zip(bbox_sizes, all_bbox_centers)):
+            _, C, T, H, W = pred_decoded.shape
+            h = bbox_size[0]
+            w = bbox_size[1]
+            pred_canvas = torch.zeros(
+                (T, C, h, w),
+                device=pred_decoded.device,
+                dtype=pred_decoded.dtype
             )
-            # set all values in mask to at least 0.1.
-            # this is again a divergence from skyreels-a1, but i believe we will want at least
-            # some training signal to reach the 'low-motion' face pixels.
-            mask = torch.clamp(mask, min=0.1)
-            combined_mask = mask * latent_mask.float()
+            target_canvas = torch.zeros(
+                (T, C, h, w),
+                device=pred_decoded.device,
+                dtype=pred_decoded.dtype
+            )
 
-        loss = ((pred_x0.float() - target.float()) ** 2) * combined_mask
-        return loss.sum(dim=(1, 2, 3, 4)) / masked_pixels.float()
+            # Take a crop from each frame in the batch item.
+            for t in range(T):
+                y, x = bbox_centers[t]
+                y = y.item()
+                x = x.item()
+                if y == -1 or x == -1:
+                    # No mask, skip this frame
+                    continue
+
+                y_start = int(y - h // 2)
+                x_start = int(x - w // 2)
+                y_end = y_start + h
+                x_end = x_start + w
+
+                def take_crop(img):
+                    crop = img[b, :, t, y_start:y_end, x_start:x_end]
+
+                    # Handle cases where crop is totally out-of-bounds
+                    if crop.shape[-2] == 0 or crop.shape[-1] == 0:
+                        return torch.zeros((C, h, w), device=img.device, dtype=img.dtype)
+
+                    # If crop is not the expected size, pad to (C, h, w)
+                    pad_h = max(h - crop.shape[-2], 0)
+                    pad_w = max(w - crop.shape[-1], 0)
+                    crop = F.pad(crop, (0, pad_w, 0, pad_h))
+                    
+                    return crop
+                
+                pred_canvas[t] = take_crop(pred_decoded)
+                target_canvas[t] = take_crop(target_decoded)
+
+            l = self.lpips_loss(pred_canvas.float(), target_canvas.float()).mean()
+            lpips_losses.append(l)
+
+        return torch.stack(lpips_losses, dim=0)

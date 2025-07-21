@@ -638,8 +638,12 @@ class SkyReelsA1V2VInpaintPipeline:
                 # Scale the frame weights by the frame factor.
                 weight = weight * frame_weights
         
-        # Compute the MSE loss scaled by the weight.
-        loss = ((pred_x0 - target) ** 2) * weight
+        # Compute the MSE loss scaled by the weight (L1 loss for pixel)
+        if is_pixel:
+            loss = (pred_x0 - target).abs() * weight
+        else:
+            loss = ((pred_x0 - target) ** 2) * weight
+            
         # Total number of elements in the space (C', T', H', W') per batch item
         size = pred_x0[0].numel()  
         return loss.sum(dim=(1, 2, 3, 4)) / size

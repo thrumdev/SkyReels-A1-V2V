@@ -200,13 +200,17 @@ class Trainer:
         if restore_checkpoint is not None:
             print("restoring optimizer state")
             optimizer_path = os.path.join(restore_checkpoint, "optimizer.pt")
-            optimizer_state = torch.load(optimizer_path, map_location=self.accelerator.device)
 
-            # Override LR
-            for optimizer_param in optimizer_state['param_groups']:
-                optimizer_param['lr'] = lr
+            if os.path.exists(optimizer_path):
+                optimizer_state = torch.load(optimizer_path, map_location=self.accelerator.device)
 
-            optimizer.load_state_dict(optimizer_state)
+                # Override LR
+                for optimizer_param in optimizer_state['param_groups']:
+                    optimizer_param['lr'] = lr
+
+                optimizer.load_state_dict(optimizer_state)
+            else:
+                print(f"No optimizer state found at {optimizer_path}. Re-initializing optimizer")
 
         if config.get("compile", False):
             self.pipeline.transformer.compile_blocks()

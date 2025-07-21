@@ -127,6 +127,7 @@ def expand_masks_randomly(masks, max_expand):
         mask_expand_x = torch.randint(0, max_expand + 1, (1,)).item()
         mask_expand_y = torch.randint(0, max_expand + 1, (1,)).item()
         masks[i] = expand_mask(masks[i], mask_expand_x, mask_expand_y)
+        masks[i] = mask_shape_best_fit(masks[i]) 
     return masks
 
 class Trainer:

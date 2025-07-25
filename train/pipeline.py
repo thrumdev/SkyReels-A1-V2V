@@ -13,6 +13,7 @@ import lpips
 
 from typing import Tuple
 import inspect
+import types
 
 from skyreels_a1.models.transformer3d import CogVideoXTransformer3DModel
 
@@ -131,6 +132,8 @@ class SkyReelsA1V2VInpaintPipeline:
         ).to(device, self.dtype)
         self.vae.enable_tiling()
 
+        self.vae.decoder.forward = types.MethodType(new_decode_forward, self.vae.decoder)
+
         self.lmk_encoder = AutoencoderKLCogVideoX.from_pretrained(
             model_name, 
             subfolder="pose_guider",
@@ -152,7 +155,7 @@ class SkyReelsA1V2VInpaintPipeline:
             self.vae.encode = torch.compile(self.vae.encode)
             self.lmk_encoder.encode = torch.compile(self.lmk_encoder.encode)
 
-        self.siglip = SiglipVisionModel.from_pretrained(siglip_name).to(device, self.dtype)
+        self.siglip = SiglipVisionModel.from_pretrained(siglip_name).to(self.dtype).to("cpu")
         self.siglip_normalize = SiglipImageProcessor.from_pretrained(siglip_name)
         self.t_config = self.transformer.config
 
@@ -324,12 +327,14 @@ class SkyReelsA1V2VInpaintPipeline:
             A tensor of shape [B, 729, 1152] where B is the number of reference videos.
         """
         
+        self.siglip.to(self.device)
         imgs = self.siglip_normalize.preprocess(images=identity_images, do_resize=True, return_tensors="pt", do_convert_rgb=True)
         imgs = imgs.to(self.device, self.dtype)
         image_embeddings = self.siglip(**imgs).last_hidden_state  # torch.Size([B, 729, 1152])
+        self.siglip.to("cpu")
 
         return image_embeddings.to(self.device, self.dtype)
-
+    
     def step_forward_and_loss(
         self, 
         ref_videos, 
@@ -421,10 +426,28 @@ class SkyReelsA1V2VInpaintPipeline:
         )
 
         pred_x0_scaled = pred_x0 * (1 / self.vae_scaling_factor_image)
-        pred_decoded = self.vae.decode(pred_x0_scaled).sample
+
+        # Choose a random block of latent frames to decode
+        latent_block_size = 3 # VAE is very size-dependent, this is the best that works.
+        # choose value between 2 and 13 - latent_block_size
+        latent_frame_start = torch.randint(0, 12 - latent_block_size, (1,)).item() + 2
+        pixel_frame_start = latent_frame_start * 4 - 3
+        pixel_frames = 4 * latent_block_size
+
+        pred_x0_scaled = pred_x0_scaled[:, :, latent_frame_start-1:latent_frame_start + latent_block_size, :, :]
+        pred_decoded = self.vae.decode(pred_x0_scaled.to(self.dtype)).sample
+
+        # take first 4 frames out
+        pred_decoded = pred_decoded[:, :, 4:, :, :]
 
         target_decoded = torch.stack(ref_videos, dim=0) * 2.0 - 1.0  # Normalize to [-1, 1]
+        target_decoded = target_decoded[:, :, pixel_frame_start:pixel_frame_start + pixel_frames, :, :].to(self.dtype)
+        
         pixel_masks = torch.stack(pixel_masks, dim=0)  # (B, 1, T, H, W)
+        pixel_masks = pixel_masks[:, :, pixel_frame_start:pixel_frame_start + pixel_frames, :, :].to(self.dtype)
+
+        optical_flow_masks = torch.stack(optical_flow_masks, dim=0)  # (B, 1, T-2, H, W)
+        optical_flow_masks = optical_flow_masks[:, :, pixel_frame_start:pixel_frame_start + pixel_frames - 2, :, :].to(self.dtype)
 
         pixel_loss = self.compute_optical_flow_face_weighted_loss(
             pred_decoded,
@@ -604,7 +627,9 @@ class SkyReelsA1V2VInpaintPipeline:
         with torch.no_grad():
             # We first downsample the optical flow mask to (B, 1, T', H', W')
             target_shape = pred_x0.shape[-3:]
-            optical_flow_mask = torch.stack(optical_flow_mask, dim=0)  # (B, 1, T-2, H, W)
+            if isinstance(optical_flow_mask, list):
+                optical_flow_mask = torch.stack(optical_flow_mask, dim=0)  # (B, 1, T-2, H, W)
+
             optical_weight = torch.nn.functional.interpolate(
                 optical_flow_mask.float(),
                 size=target_shape,
@@ -622,7 +647,7 @@ class SkyReelsA1V2VInpaintPipeline:
 
             frame_loss_scaling = self.config.get("frame_loss_scaling", 0.05)
             if is_pixel:
-                frame_loss_scaling = frame_loss_scaling / 4.0
+                frame_loss_scaling = 0.0
 
             if frame_loss_scaling > 0.0:
                 # create a tensor, shape (B, 1, T', H', W') where all the items for frame t
@@ -693,9 +718,9 @@ class SkyReelsA1V2VInpaintPipeline:
             max_bbox_sizes.append(max_size * (1 + grow_bbox_by))
             all_centers.append(torch.stack(centers))  # (T, 2)
 
-        max_bbox_sizes = torch.stack(max_bbox_sizes, device=pixel_masks.device)  # (B, 2)
-        all_centers = torch.stack(all_centers, device=pixel_masks.device)  # (B, T, 2)
-        return max_bbox_sizes, all_centers
+        max_bbox_sizes = torch.stack(max_bbox_sizes)  # (B, 2)
+        all_centers = torch.stack(all_centers)  # (B, T, 2)
+        return max_bbox_sizes.to(self.device), all_centers.to(self.device)
 
     def compute_cropped_lpips_loss(self, pred_decoded, target_decoded, pixel_masks):
         """
@@ -716,8 +741,8 @@ class SkyReelsA1V2VInpaintPipeline:
         lpips_losses = []
         for b, (bbox_size, bbox_centers) in enumerate(zip(bbox_sizes, all_bbox_centers)):
             _, C, T, H, W = pred_decoded.shape
-            h = bbox_size[0]
-            w = bbox_size[1]
+            h = int(bbox_size[0].item())
+            w = int(bbox_size[1].item())
             pred_canvas = torch.zeros(
                 (T, C, h, w),
                 device=pred_decoded.device,
@@ -760,7 +785,52 @@ class SkyReelsA1V2VInpaintPipeline:
                 pred_canvas[t] = take_crop(pred_decoded)
                 target_canvas[t] = take_crop(target_decoded)
 
-            l = self.lpips_loss(pred_canvas.float(), target_canvas.float()).mean()
+            l = self.lpips_loss(pred_canvas, target_canvas).mean()
             lpips_losses.append(l)
 
         return torch.stack(lpips_losses, dim=0)
+    
+def new_decode_forward(
+    self,
+    sample: torch.Tensor,
+    temb = None,
+    conv_cache = None,
+) -> torch.Tensor:
+    r"""The forward method of the `CogVideoXDecoder3D` class."""
+
+    new_conv_cache = {}
+    conv_cache = conv_cache or {}
+
+    def forward_inner(sample):
+        hidden_states, new_conv_cache["conv_in"] = self.conv_in(sample, conv_cache=conv_cache.get("conv_in"))
+
+        # 1. Mid
+        hidden_states, new_conv_cache["mid_block"] = self.mid_block(
+            hidden_states, temb, sample, conv_cache=conv_cache.get("mid_block")
+        )
+
+        # 2. Up
+        for i, up_block in enumerate(self.up_blocks):
+            conv_cache_key = f"up_block_{i}"
+            hidden_states, new_conv_cache[conv_cache_key] = up_block(
+                hidden_states, temb, sample, conv_cache=conv_cache.get(conv_cache_key)
+            )
+
+        # 3. Post-process
+        hidden_states, new_conv_cache["norm_out"] = self.norm_out(
+            hidden_states, sample, conv_cache=conv_cache.get("norm_out")
+        )
+        hidden_states = self.conv_act(hidden_states)
+        hidden_states, new_conv_cache["conv_out"] = self.conv_out(hidden_states, conv_cache=conv_cache.get("conv_out"))
+        return hidden_states, new_conv_cache
+
+
+    if torch.is_grad_enabled() and self.gradient_checkpointing:
+        hidden_states, new_conv_cache = self._gradient_checkpointing_func(
+            forward_inner,
+            sample,
+        )
+    else:
+        hidden_states, new_conv_cache = forward_inner(sample)
+
+    return hidden_states, new_conv_cache

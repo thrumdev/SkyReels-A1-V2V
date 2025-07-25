@@ -7,6 +7,7 @@ import time
 import cv2
 import numpy as np
 import tqdm
+import gc
 
 from .dataloader import get_dataloader, list_collate
 from .pipeline import SkyReelsA1V2VInpaintPipeline
@@ -349,6 +350,9 @@ class Trainer:
                     return max_steps
                 
                 log_dict = self.train_one_step(batch)
+                gc.collect()
+                torch.cuda.empty_cache()
+                
                 self.ingest_log_dict(log_dict)
 
                 self._step_in_accum += 1

@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import tqdm
 import gc
+import traceback
 
 from .dataloader import get_dataloader, list_collate
 from .pipeline import SkyReelsA1V2VInpaintPipeline
@@ -310,7 +311,6 @@ class Trainer:
             self.pbar = tqdm.tqdm(
                 total=self.gradient_accumulation_steps, 
                 desc="substeps",
-                leave=False,
             )
 
     def step_pbar(self):
@@ -349,9 +349,32 @@ class Trainer:
                     print(f"Reached maximum training steps: {max_steps}. Stopping training.")
                     return max_steps
                 
-                log_dict = self.train_one_step(batch)
+                failed = False
+                try:
+                    log_dict = self.train_one_step(batch)
+                except Exception as e:
+                    skipped_substeps += 1
+                    print(f"Error during training step {step}. Restarting.")
+                    traceback.print_exc()
+                    failed = True
+
                 gc.collect()
                 torch.cuda.empty_cache()
+
+                # on failure: restart step
+                any_failed = self.accelerator.reduce(
+                    torch.tensor([float(failed)]).to(self.accelerator.device), 
+                    reduction="sum",
+                ).item() > 0.0
+
+                if any_failed:
+                    if self.accelerator.is_main_process:
+                        print(f"Returning to beginning of step {step}")
+
+                    self._step_in_accum = 0
+                    self.init_pbar()
+                    self.optimizer.zero_grad()
+                    continue
                 
                 self.ingest_log_dict(log_dict)
 

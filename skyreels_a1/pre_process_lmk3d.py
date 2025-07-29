@@ -9,7 +9,6 @@ from PIL import Image
 from decord import VideoReader
 from skimage.transform import estimate_transform, warp
 from insightface.app import FaceAnalysis
-from diffusers.utils import load_image
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from skyreels_a1.src.utils.mediapipe_utils import MediaPipeUtils
@@ -21,9 +20,13 @@ class FaceAnimationProcessor:
     def __init__(self, device='cuda', checkpoint="pretrained_models/smirk/smirk_encoder.pt"):
         self.device = device
         self.app = FaceAnalysis(allowed_modules=['detection'])
+        print("preparing")
         self.app.prepare(ctx_id=0, det_size=(640, 640))
+        print("done preparing")
         self.smirk_encoder = SmirkEncoder().to(device)
+        self.smirk_encoder = None
         self.flame = FLAME(n_shape=300, n_exp=50).to(device)
+        self.flame = None
         self.renderer = Renderer().to(device)
         self.mediapipe_utils = MediaPipeUtils()
         self.load_checkpoint(checkpoint)
@@ -51,11 +54,32 @@ class FaceAnimationProcessor:
         pts = np.array(kps, dtype=np.int32)
         cv2.fillConvexPoly(mask, pts, 1)
         return mask
+    
+    def faces(self, image):
+        faces = self.app.get(image)
+        return faces
 
     def face_crop(self, image):
         height, width, _ = image.shape
         faces = self.app.get(image)
         bbox = faces[0]['bbox']
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+        x1 = max(0, int(bbox[0] - w/2))
+        x2 = min(width - 1, int(bbox[2] + w/2))
+        w_new = x2 - x1
+        y_offset = (w_new - h) / 2.
+        y1 = max(0, int(bbox[1] - y_offset))
+        y2 = min(height, int(bbox[3] + y_offset))
+        x_comp = int(((x2 - x1) - (y2 - y1)) / 2) if (x2 - x1) > (y2 - y1) else 0
+        x1 += x_comp
+        x2 -= x_comp
+        image_crop = image[y1:y2, x1:x2]
+        return image_crop, x1, y1
+
+    def face_crop_with_provided(self, image, face):
+        height, width, _ = image.shape
+        bbox = face['bbox']
         w = bbox[2] - bbox[0]
         h = bbox[3] - bbox[1]
         x1 = max(0, int(bbox[0] - w/2))

@@ -9,13 +9,12 @@ import cv2
 import multiprocessing
 
 from skyreels_a1.pre_process_lmk3d import FaceAnimationProcessor
-from skyreels_a1.src.media_pipe.mp_utils  import LMKExtractor
-from skyreels_a1.src.media_pipe.draw_util_2d import FaceMeshVisualizer2d
 from facexlib.utils.face_restoration_helper import FaceRestoreHelper
 from time import sleep
 from tqdm import tqdm as tqdm_main
 
 from .memfof.core.memfof import MEMFOF
+from .face_tracker import FaceTracker
 
 MEMFOF_MODEL = "MEMFOF-Tartan-T-TSKH"
 
@@ -82,9 +81,7 @@ class Preprocessor:
         self.video_dir = args.video_dir
         self.output_dir = args.output_dir
         
-        self.lmk_extractor = LMKExtractor()
         self.processor = FaceAnimationProcessor(checkpoint=args.smirk_checkpoint)
-        self.face_vis = FaceMeshVisualizer2d(forehead_edge=False, draw_head=False, draw_iris=False,)
         self.face_helper = FaceRestoreHelper(upscale_factor=1, face_size=512, crop_ratio=(1, 1), det_model='retinaface_resnet50', save_ext='png', device=device)
         self.manifest = []
 
@@ -100,49 +97,85 @@ class Preprocessor:
         Args:
             control_frames (torch.Tensor): Tensor of shape (C, T, H, W)
         Returns:
-            driving_video (torch.Tensor): shape (C, T, H, W)
+            driving_video (list(torch.Tensor)): shape [(C, T, H, W)]
+            one for each subclip.
+            landmarks: (list of numpy arrays), one for each subclip
+            clips: (list of clip objects)
         """
+        print("Processing facial landmarks...")
+
         driving_video_crop = []
         ref_faces = []
+
+        face_tracker = FaceTracker(n_frames=control_frames.shape[1])
         # Iterate over the temporal dimension (T) of control_frames
         T = control_frames.shape[1]
         for t in range(T):
             control_frame = control_frames[:, t, :, :]
             frame_np = control_frame.permute(1, 2, 0).cpu().numpy()
             frame_np = (frame_np * 255).astype(np.uint8)
-            ref_image, x1, y1 = self.processor.face_crop(frame_np)
-            ref_faces.append((ref_image, x1, y1))
-            driving_video_crop.append(ref_image)
-
-        driving_video = driving_video_crop
-
-        # The original SkyReels A1 inference code separates the first frame and the subsequent frames,
-        # but in our self-reenactment approach they are the same. therefore we can populate it more
-        # similarly.
-        out_frames, landmarks = self.processor.preprocess_lmk3d_self_reenactment(driving_video)
+            faces = self.processor.faces(frame_np)
+            face_tracker.ingest_frame(frame_np, faces)
         
-        n_frames = len(out_frames)
-        c, h, w = control_frames[:, 0, :, :].shape
-        input_video = np.zeros((h, w, c), dtype=np.float32)[np.newaxis, :].repeat(n_frames, axis=0)
-        for ii in range(n_frames):
-            ref_face, x1, y1 = ref_faces[ii]
-            face_h, face_w, _ = ref_face.shape
-            input_video[ii][y1:y1+face_h, x1:x1+face_w] = out_frames[ii]
+        clips = face_tracker.make_clips()
+        if len(clips) == 0:
+            return [], [], []
+        
+        all_input_videos = []
+        all_landmarks = []
 
-            if landmarks[ii] is not None:
-                # add (x1, y1) to all items in landmarks
-                landmarks[ii][:, 0] += x1
-                landmarks[ii][:, 1] += y1
+        for clip in clips:
+            start = clip['start']
+            end = clip['end']
+            for t in range(start, end + 1):
+                control_frame = control_frames[:, t, :, :]
+                frame_np = control_frame.permute(1, 2, 0).cpu().numpy()
+                frame_np = (frame_np * 255).astype(np.uint8)
+                face = clip['faces'].get(t - start, None)
 
-        # concat with remaining motion frames.
-        input_video = torch.from_numpy(np.array(input_video))
-        input_video = input_video / 255
-        # reshape input video to [C, T, H, W]
-        input_video = input_video.permute(3, 0, 1, 2)
+                # When a face can't be detected (usually 1 frame intermittent)
+                # we just crop to the dimensions of the last face.
+                if face is None:
+                    face = last_face
+                    clip['faces'][t - start] = last_face
 
-        return input_video, landmarks
+                last_face = face
+                ref_image, x1, y1 = self.processor.face_crop_with_provided(frame_np, face)
+                ref_faces.append((ref_image, x1, y1))
+                driving_video_crop.append(ref_image)
+
+            driving_video = driving_video_crop
+
+            # The original SkyReels A1 inference code separates the first frame and the subsequent frames,
+            # but in our self-reenactment approach they are the same. therefore we can populate it more
+            # similarly.
+            out_frames, landmarks = self.processor.preprocess_lmk3d_self_reenactment(driving_video)
+            
+            n_frames = len(out_frames)
+            c, h, w = control_frames[:, 0, :, :].shape
+            input_video = np.zeros((h, w, c), dtype=np.float32)[np.newaxis, :].repeat(n_frames, axis=0)
+            for ii in range(n_frames):
+                ref_face, x1, y1 = ref_faces[ii]
+                face_h, face_w, _ = ref_face.shape
+                input_video[ii][y1:y1+face_h, x1:x1+face_w] = out_frames[ii]
+
+                if landmarks[ii] is not None:
+                    # add (x1, y1) to all items in landmarks
+                    landmarks[ii][:, 0] += x1
+                    landmarks[ii][:, 1] += y1
+
+            # concat with remaining motion frames.
+            input_video = torch.from_numpy(np.array(input_video))
+            input_video = input_video / 255
+            # reshape input video to [C, T, H, W]
+            input_video = input_video.permute(3, 0, 1, 2)
+
+            all_input_videos.append(input_video)
+            all_landmarks.append(landmarks)
+
+        return input_video, landmarks, clips
     
-    def pixel_mask(self, video_tensor, landmarks):
+    def pixel_mask(self, video_tensor, landmarks, faces):
         """
         Given a video tensor, produce a pixel mask which covers the face region for each frame.
         Args:
@@ -150,23 +183,34 @@ class Preprocessor:
             landmarks (list): List of landmarks for each frame, where each item is either None
             or a numpy array of shape (N, 2) containing the (x, y) coordinates of the landmarks.
             None means that mediapipe didn't find any landmarks for that frame.
+            faces (dict): Frame to face mapping.
         Returns:
             torch.Tensor: Pixel mask of shape (1, T, H, W) where 1 indicates inside the face region, 0 otherwise.
         """
         C, T, H, W = video_tensor.shape
         mask = torch.zeros((1, T, H, W), dtype=torch.float32, device=video_tensor.device)
         for i in range(T):
+            face_mask = None
             if landmarks[i] is None:
-                # If no landmarks were found, skip this frame. Treat the entire frame as masked
-                mask[:, i, :, :] = 1.0
-                continue
-
-            image = video_tensor[:, i, :, :].permute(1, 2, 0)  # (H, W, C)
-            image = image.cpu().numpy() * 255
-            image = image.astype(np.uint8)
-            face_mask = np.zeros((H, W), dtype=np.uint8)
-            hull = cv2.convexHull(landmarks[i].astype(np.int32))
-            cv2.fillPoly(face_mask, [hull], 1)
+                face = faces.get(i, None)
+                if face is None:
+                    # If no landmarks were found, skip this frame. Treat the entire frame as masked
+                    mask[:, i, :, :] = 1.0
+                    continue
+                
+                # No landmarks found, but face provided. Use the bounding box of the face.
+                face_bbox = face['bbox']
+                x1, y1, x2, y2 = face_bbox
+                face_mask = np.zeros((H, W), dtype=np.uint8)
+                cv2.rectangle(face_mask, (x1, y1), (x2, y2), 1, thickness=cv2.FILLED)
+            else:
+                # Convex hull of landmarks.
+                image = video_tensor[:, i, :, :].permute(1, 2, 0)  # (H, W, C)
+                image = image.cpu().numpy() * 255
+                image = image.astype(np.uint8)
+                face_mask = np.zeros((H, W), dtype=np.uint8)
+                hull = cv2.convexHull(landmarks[i].astype(np.int32))
+                cv2.fillPoly(face_mask, [hull], 1)
             # transform face_mask into a torch tensor of shape [1, H, W]
             face_mask = torch.tensor(face_mask, dtype=torch.float32, device=video_tensor.device)
             face_mask = face_mask.unsqueeze(0)  # shape (1, H, W)
@@ -243,35 +287,13 @@ class Preprocessor:
         # note: we keep the range in 0, 255
         return image_face
 
-    def preprocess_video(self, video_path):
-        """
-        Preprocess a single video file.
-        This loads the MP4 file, extracts frames, and converts them to a tensor.
-        Then it computes facial landmarks, pixel masks, and optical flow masks.
-        Then it writes these components to a file in the output directory and updates the manifest.
-        Args:
-            video_path (str): Path to the video file to preprocess.
-        """
-
-        video_id = os.path.splitext(video_path.split("/")[-1])[0]
-
-        video = VideoReader(video_path, num_threads=1)
-        frames = video.get_batch(range(len(video))).asnumpy()  # Load all frames as numpy array
-        frames_tensor = torch.tensor(frames).permute(3, 0, 1, 2) # Shape is now (C, T, H, W)
-        frames_tensor = frames_tensor.float() / 255.0
-
+    def mask_and_save_video(self, video_id, frames_tensor, driving_video, landmarks, clip):
         _, _, height, width = frames_tensor.shape
 
-        try:
-            driving_video, landmarks = self.facial_landmarks(frames_tensor)
-            pixel_mask = self.pixel_mask(frames_tensor, landmarks)
-            optical_flow_mask = self.optical_flow_mask(frames_tensor, batch_size=self.args.optical_batch_size)
-            identity_image = self.cropped_aligned_identity(frames_tensor)
-        except Exception as e:
-            print(f"[ERROR] Skipping video {video_path} due to error: {e}")
-            return
+        pixel_mask = self.pixel_mask(frames_tensor, landmarks, clip['faces'])
+        #optical_flow_mask = self.optical_flow_mask(frames_tensor, batch_size=self.args.optical_batch_size)
+        identity_image = self.cropped_aligned_identity(frames_tensor)
 
-        # Save original video. Permute to (T, H, W, C) for video saving
         original_video_np = (frames_tensor.permute(1, 2, 3, 0).cpu().numpy() * 255).astype(np.uint8) # (T, H, W, C)
         out_path = os.path.join(self.output_dir, f"{video_id}_original.avi")
         fourcc = cv2.VideoWriter_fourcc(*'FFV1')
@@ -315,6 +337,66 @@ class Preprocessor:
             "resolution": f"{width}x{height}",
         })
 
+    def preprocess_video(self, video_path):
+        """
+        Preprocess a single video file.
+        This loads the MP4 file, extracts frames, and converts them to a tensor.
+        Then it computes facial landmarks, pixel masks, and optical flow masks.
+        Then it writes these components to a file in the output directory and updates the manifest.
+        Args:
+            video_path (str): Path to the video file to preprocess.
+        """
+
+        video_id = os.path.splitext(video_path.split("/")[-1])[0]
+
+        video = VideoReader(video_path, num_threads=1)
+        frames = video.get_batch(range(len(video))).asnumpy()  # Load all frames as numpy array
+        frames_tensor = torch.tensor(frames).permute(3, 0, 1, 2) # Shape is now (C, T, H, W)
+        frames_tensor = frames_tensor.float() / 255.0
+
+        _, _, height, width = frames_tensor.shape
+
+        try:
+            driving_videos, all_landmarks, clips = self.facial_landmarks(frames_tensor)
+            if len(clips) == 0:
+                print(f"[WARNING] No faces detected in video {video_path}. Skipping.")
+                return
+            elif len(clips) == 1:
+                start = clips[0]['start']
+                end = clips[0]['end']
+                self.mask_and_save_video(
+                    video_id,
+                    frames_tensor[:, start:end+1, :, :],
+                    driving_videos[0],
+                    all_landmarks[0],
+                    clips[0]
+                )
+            else:
+                for i, clip in enumerate(clips):
+                    start = clip['start']
+                    end = clip['end']
+                    # Get the corresponding driving video and landmarks
+                    driving_video = driving_videos[i]
+                    landmarks = all_landmarks[i]
+                    self.mask_and_save_video(
+                        f"{video_id}_{i}",
+                        frames_tensor[:, start:end+1, :, :],
+                        driving_video,
+                        landmarks,
+                        clip
+                    )
+
+            # driving_video, landmarks = self.facial_landmarks(frames_tensor)
+            # pixel_mask = self.pixel_mask(frames_tensor, landmarks)
+            # optical_flow_mask = self.optical_flow_mask(frames_tensor, batch_size=self.args.optical_batch_size)
+            # identity_image = self.cropped_aligned_identity(frames_tensor)
+        except Exception as e:
+            print(f"[ERROR] Skipping video {video_path} due to error: {e}")
+            # backtrace
+            import traceback
+            traceback.print_exc()
+            return
+
     def write_manifest(self):
         """
         Write the manifest file to the output directory.
@@ -355,7 +437,7 @@ def main():
     args = parser.parse_args()
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
-    video_files = [f for f in os.listdir(args.video_dir) if f.endswith('.mp4')]
+    video_files = [f for f in os.listdir(args.video_dir) if f.endswith('.avi') or f.endswith('.mp4') or f.endswith('.mov')]
     if args.count is not None:
         video_files = video_files[:args.count]
     if args.num_workers > 1 and not args.early_exit:
@@ -419,7 +501,7 @@ def main():
             print("Early exit requested, preprocessor created but no videos processed.")
             return
         
-        for video_file in tqdm(video_files, desc="Processing videos"):
+        for video_file in tqdm_main(video_files, desc="Processing videos"):
             video_path = os.path.join(args.video_dir, video_file)
             preprocessor.preprocess_video(video_path)
         preprocessor.write_manifest()

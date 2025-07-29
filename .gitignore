@@ -3,3 +3,4 @@ __pycache__/
 .gradio/
 outputs/
 outputs_audio/
+.venv

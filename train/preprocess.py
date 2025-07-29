@@ -354,8 +354,6 @@ class Preprocessor:
         frames_tensor = torch.tensor(frames).permute(3, 0, 1, 2) # Shape is now (C, T, H, W)
         frames_tensor = frames_tensor.float() / 255.0
 
-        _, _, height, width = frames_tensor.shape
-
         try:
             driving_videos, all_landmarks, clips = self.facial_landmarks(frames_tensor)
             if len(clips) == 0:
@@ -375,7 +373,6 @@ class Preprocessor:
                 for i, clip in enumerate(clips):
                     start = clip['start']
                     end = clip['end']
-                    # Get the corresponding driving video and landmarks
                     driving_video = driving_videos[i]
                     landmarks = all_landmarks[i]
                     self.mask_and_save_video(
@@ -385,11 +382,6 @@ class Preprocessor:
                         landmarks,
                         clip
                     )
-
-            # driving_video, landmarks = self.facial_landmarks(frames_tensor)
-            # pixel_mask = self.pixel_mask(frames_tensor, landmarks)
-            # optical_flow_mask = self.optical_flow_mask(frames_tensor, batch_size=self.args.optical_batch_size)
-            # identity_image = self.cropped_aligned_identity(frames_tensor)
         except Exception as e:
             print(f"[ERROR] Skipping video {video_path} due to error: {e}")
             # backtrace

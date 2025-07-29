@@ -129,7 +129,7 @@ class SkyReelsA1V2VInpaintPipeline:
         self.vae = AutoencoderKLCogVideoX.from_pretrained(
             model_name, 
             subfolder="vae"
-        ).to(device, self.dtype)
+        ).to(device, self.dtype).to("cpu")
         self.vae.enable_tiling()
 
         self.vae.decoder.forward = types.MethodType(new_decode_forward, self.vae.decoder)
@@ -137,7 +137,7 @@ class SkyReelsA1V2VInpaintPipeline:
         self.lmk_encoder = AutoencoderKLCogVideoX.from_pretrained(
             model_name, 
             subfolder="pose_guider",
-        ).to(device, self.dtype)
+        ).to(device, self.dtype).to("cpu")
 
         self.scheduler = CogVideoXDDIMScheduler.from_pretrained(
             model_name,
@@ -280,6 +280,7 @@ class SkyReelsA1V2VInpaintPipeline:
         ref_videos = ref_videos * 2.0 - 1.0
         driving_videos = driving_videos * 2.0 - 1.0
 
+        self.vae.encoder.to(self.device)
         if noisy_latent is None:
             clean_latent = self.vae.encode(ref_videos).latent_dist.sample()  # (B, C, T', H', W_)
             clean_latent = clean_latent * self.vae_scaling_factor_image
@@ -304,8 +305,12 @@ class SkyReelsA1V2VInpaintPipeline:
         ref_videos = self.dropout_ref_frames(ref_videos)
         ref_latent = self.vae.encode(ref_videos).latent_dist.sample() * self.vae_scaling_factor_image
 
+        self.vae.encoder.to("cpu")
+        self.lmk_encoder.encoder.to(self.device)
         lmk_latent = self.lmk_encoder.encode(driving_videos).latent_dist.mode()
         lmk_latent *= self.lmk_scaling_factor_image
+
+        self.lmk_encoder.encoder.to("cpu")
 
         # concatenate along channel dimension (B, C, T', H', W')
         if self.explicit_mask_channels:
@@ -435,6 +440,8 @@ class SkyReelsA1V2VInpaintPipeline:
         pixel_frames = 4 * latent_block_size
 
         pred_x0_scaled = pred_x0_scaled[:, :, latent_frame_start-1:latent_frame_start + latent_block_size, :, :]
+        
+        self.vae.decoder.to(self.device)
         pred_decoded = self.vae.decode(pred_x0_scaled.to(self.dtype)).sample
 
         # take first 4 frames out

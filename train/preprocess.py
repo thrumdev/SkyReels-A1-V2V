@@ -14,7 +14,7 @@ from time import sleep
 from tqdm import tqdm as tqdm_main
 
 from .memfof.core.memfof import MEMFOF
-from .face_tracker import FaceTracker
+from .face_tracker import FaceTracker, ensure_arc_exists
 
 MEMFOF_MODEL = "MEMFOF-Tartan-T-TSKH"
 
@@ -429,6 +429,9 @@ def main():
     args = parser.parse_args()
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
+
+    ensure_arc_exists()
+    
     video_files = [f for f in os.listdir(args.video_dir) if f.endswith('.avi') or f.endswith('.mp4') or f.endswith('.mov')]
     if args.count is not None:
         video_files = video_files[:args.count]

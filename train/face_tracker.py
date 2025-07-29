@@ -3,6 +3,18 @@ import insightface
 from insightface.utils import face_align 
 import cv2
 import onnxruntime as ort
+import huggingface_hub
+import os
+
+arc_path = "pretrained_models/arc/arc.onnx"
+
+def ensure_arc_exists():
+    if not os.path.exists(arc_path):
+        huggingface_hub.hf_hub_download(
+            repo_id="garavv/arcface-onnx",
+            filename="arc.onnx",
+            local_dir="pretrained_models/arc",
+        )
 
 class FaceTracker:
     """
@@ -21,7 +33,7 @@ class FaceTracker:
         self.individuals = []  # List to hold individual face trackers
         self.max_missing_frames = max_missing_frames
         self.min_clip_length = min_clip_length
-        self.onnxsess = ort.InferenceSession("pretrained_models/arc/arc.onnx")
+        self.onnxsess = ort.InferenceSession(arc_path)
         self.face_count_at = []
 
 

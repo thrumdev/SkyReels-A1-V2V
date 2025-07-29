@@ -173,7 +173,7 @@ class Preprocessor:
             all_input_videos.append(input_video)
             all_landmarks.append(landmarks)
 
-        return input_video, all_landmarks, clips
+        return all_input_videos, all_landmarks, clips
     
     def pixel_mask(self, video_tensor, landmarks, faces):
         """
@@ -202,7 +202,7 @@ class Preprocessor:
                 face_bbox = face['bbox']
                 x1, y1, x2, y2 = face_bbox
                 face_mask = np.zeros((H, W), dtype=np.uint8)
-                cv2.rectangle(face_mask, (x1, y1), (x2, y2), 1, thickness=cv2.FILLED)
+                cv2.rectangle(face_mask, (int(x1), int(y1)), (int(x2), int(y2)), 1, thickness=cv2.FILLED)
             else:
                 # Convex hull of landmarks.
                 image = video_tensor[:, i, :, :].permute(1, 2, 0)  # (H, W, C)
@@ -291,7 +291,7 @@ class Preprocessor:
         _, _, height, width = frames_tensor.shape
 
         pixel_mask = self.pixel_mask(frames_tensor, landmarks, clip['faces'])
-        #optical_flow_mask = self.optical_flow_mask(frames_tensor, batch_size=self.args.optical_batch_size)
+        optical_flow_mask = self.optical_flow_mask(frames_tensor, batch_size=self.args.optical_batch_size)
         identity_image = self.cropped_aligned_identity(frames_tensor)
 
         original_video_np = (frames_tensor.permute(1, 2, 3, 0).cpu().numpy() * 255).astype(np.uint8) # (T, H, W, C)

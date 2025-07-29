@@ -31,7 +31,7 @@ class FaceAnimationProcessor:
         checkpoint_data = torch.load(checkpoint)
         checkpoint_encoder = {k.replace('smirk_encoder.', ''): v for k, v in checkpoint_data.items() if 'smirk_encoder' in k}
         self.smirk_encoder.load_state_dict(checkpoint_encoder)
-        self.smirk_encoder.eval()
+        self.smirk_encoder.eval().cuda()
 
     def face_mask(self, image):
         """

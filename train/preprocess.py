@@ -173,7 +173,7 @@ class Preprocessor:
             all_input_videos.append(input_video)
             all_landmarks.append(landmarks)
 
-        return input_video, landmarks, clips
+        return input_video, all_landmarks, clips
     
     def pixel_mask(self, video_tensor, landmarks, faces):
         """
@@ -431,7 +431,7 @@ def main():
         os.makedirs(args.output_dir)
 
     ensure_arc_exists()
-    
+
     video_files = [f for f in os.listdir(args.video_dir) if f.endswith('.avi') or f.endswith('.mp4') or f.endswith('.mov')]
     if args.count is not None:
         video_files = video_files[:args.count]

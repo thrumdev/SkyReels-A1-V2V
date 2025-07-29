@@ -33,7 +33,7 @@ class FaceTracker:
         self.individuals = []  # List to hold individual face trackers
         self.max_missing_frames = max_missing_frames
         self.min_clip_length = min_clip_length
-        self.onnxsess = ort.InferenceSession(arc_path)
+        self.onnxsess = ort.InferenceSession(arc_path, providers=['CUDAExecutionProvider'])
         self.face_count_at = []
 
 

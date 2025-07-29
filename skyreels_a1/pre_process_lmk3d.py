@@ -20,13 +20,9 @@ class FaceAnimationProcessor:
     def __init__(self, device='cuda', checkpoint="pretrained_models/smirk/smirk_encoder.pt"):
         self.device = device
         self.app = FaceAnalysis(allowed_modules=['detection'])
-        print("preparing")
         self.app.prepare(ctx_id=0, det_size=(640, 640))
-        print("done preparing")
         self.smirk_encoder = SmirkEncoder().to(device)
-        self.smirk_encoder = None
         self.flame = FLAME(n_shape=300, n_exp=50).to(device)
-        self.flame = None
         self.renderer = Renderer().to(device)
         self.mediapipe_utils = MediaPipeUtils()
         self.load_checkpoint(checkpoint)

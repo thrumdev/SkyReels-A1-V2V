@@ -21,7 +21,7 @@ class FaceTracker:
         self.individuals = []  # List to hold individual face trackers
         self.max_missing_frames = max_missing_frames
         self.min_clip_length = min_clip_length
-        self.onnxsess = ort.InferenceSession("/home/robert/.insightface/models/arc.onnx")
+        self.onnxsess = ort.InferenceSession("pretrained_models/arc/arc.onnx")
         self.face_count_at = []
 
 

@@ -432,29 +432,37 @@ class SkyReelsA1V2VInpaintPipeline:
 
         pred_x0_scaled = pred_x0 * (1 / self.vae_scaling_factor_image)
 
-        # Choose a random block of latent frames to decode
-        latent_block_size = 3 # VAE is very size-dependent, this is the best that works.
-        # choose value between 2 and 13 - latent_block_size
-        latent_frame_start = torch.randint(0, 12 - latent_block_size, (1,)).item() + 2
-        pixel_frame_start = latent_frame_start * 4 - 3
-        pixel_frames = 4 * latent_block_size
-
-        pred_x0_scaled = pred_x0_scaled[:, :, latent_frame_start-1:latent_frame_start + latent_block_size, :, :]
-        
         self.vae.decoder.to(self.device)
-        pred_decoded = self.vae.decode(pred_x0_scaled.to(self.dtype)).sample
+        if self.config.get("partial_vae_only", True):
 
-        # take first 4 frames out
-        pred_decoded = pred_decoded[:, :, 4:, :, :]
+            # Choose a random block of latent frames to decode, saves VRAM
+            latent_block_size = 3 # VAE is very size-dependent, this is the best that works.
+            # choose value between 2 and 13 - latent_block_size
+            latent_frame_start = torch.randint(0, 12 - latent_block_size, (1,)).item() + 2
+            pixel_frame_start = latent_frame_start * 4 - 3
+            pixel_frames = 4 * latent_block_size
 
-        target_decoded = torch.stack(ref_videos, dim=0) * 2.0 - 1.0  # Normalize to [-1, 1]
-        target_decoded = target_decoded[:, :, pixel_frame_start:pixel_frame_start + pixel_frames, :, :].to(self.dtype)
+            pred_x0_scaled = pred_x0_scaled[:, :, latent_frame_start-1:latent_frame_start + latent_block_size, :, :]
+            
+            pred_decoded = self.vae.decode(pred_x0_scaled.to(self.dtype)).sample
+
+            # take first 4 frames out
+            pred_decoded = pred_decoded[:, :, 4:, :, :]
+
+            target_decoded = torch.stack(ref_videos, dim=0) * 2.0 - 1.0  # Normalize to [-1, 1]
+            target_decoded = target_decoded[:, :, pixel_frame_start:pixel_frame_start + pixel_frames, :, :].to(self.dtype)
         
-        pixel_masks = torch.stack(pixel_masks, dim=0)  # (B, 1, T, H, W)
-        pixel_masks = pixel_masks[:, :, pixel_frame_start:pixel_frame_start + pixel_frames, :, :].to(self.dtype)
+            pixel_masks = torch.stack(pixel_masks, dim=0)  # (B, 1, T, H, W)
+            pixel_masks = pixel_masks[:, :, pixel_frame_start:pixel_frame_start + pixel_frames, :, :].to(self.dtype)
 
-        optical_flow_masks = torch.stack(optical_flow_masks, dim=0)  # (B, 1, T-2, H, W)
-        optical_flow_masks = optical_flow_masks[:, :, pixel_frame_start:pixel_frame_start + pixel_frames - 2, :, :].to(self.dtype)
+            optical_flow_masks = torch.stack(optical_flow_masks, dim=0)  # (B, 1, T-2, H, W)
+            optical_flow_masks = optical_flow_masks[:, :, pixel_frame_start:pixel_frame_start + pixel_frames - 2, :, :].to(self.dtype)
+        else:
+            pred_decoded = self.vae.decode(pred_x0_scaled.to(self.dtype)).sample
+            target_decoded = torch.stack(ref_videos, dim=0) * 2.0 - 1.0 # Normalize to [-1, 1]
+            target_decoded = target_decoded.to(self.dtype)
+
+            optical_flow_masks = torch.stack(optical_flow_masks, dim=0).to(self.dtype)  # (B, 1, T-2, H, W)
 
         pixel_loss = self.compute_optical_flow_face_weighted_loss(
             pred_decoded,

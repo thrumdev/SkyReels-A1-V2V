@@ -43,3 +43,4 @@ total_loss_scaling: 1.0
 grow_bbox_by: 0.08
 log_components: false
 use_adamuon: true
+partial_vae_only: true

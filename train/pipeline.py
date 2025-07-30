@@ -462,6 +462,7 @@ class SkyReelsA1V2VInpaintPipeline:
             target_decoded = torch.stack(ref_videos, dim=0) * 2.0 - 1.0 # Normalize to [-1, 1]
             target_decoded = target_decoded.to(self.dtype)
 
+            pixel_masks = torch.stack(pixel_masks, dim=0).to(self.dtype)  # (B, 1, T, H, W)
             optical_flow_masks = torch.stack(optical_flow_masks, dim=0).to(self.dtype)  # (B, 1, T-2, H, W)
 
         pixel_loss = self.compute_optical_flow_face_weighted_loss(

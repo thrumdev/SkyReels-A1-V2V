@@ -389,7 +389,6 @@ class Trainer:
                 try:
                     log_dict = self.train_one_step(batch)
                 except Exception as e:
-                    skipped_substeps += 1
                     print(f"Error during training step {step}. Restarting.")
                     traceback.print_exc()
                     failed = True

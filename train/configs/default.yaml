@@ -26,6 +26,7 @@ gradient_accumulation_steps: 4
 compile: false
 logit_normal_blend: 0.6
 #restore_checkpoint: /path/to/checkpoint
+#skip_restore_optimizer: false
 #start_step: 0
 explicit_mask_channels: true
 # inference_name: mp4_name
@@ -41,3 +42,4 @@ lpips_loss_lambda: 0.1
 total_loss_scaling: 1.0
 grow_bbox_by: 0.08
 log_components: false
+use_adamuon: true

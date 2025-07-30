@@ -1,6 +1,7 @@
 from omegaconf import OmegaConf
 from accelerate import Accelerator
 from peft import LoraConfig, PeftModel, get_peft_model
+from pytorch_optimizer import AdaMuon
 import torch
 import os
 import time
@@ -132,6 +133,32 @@ def expand_masks_randomly(masks, max_expand):
         masks[i] = mask_shape_best_fit(masks[i]) 
     return masks
 
+def make_optimizer(transformer, lr, use_muon=False):
+    if not use_muon:
+        trained_params = filter(lambda p: p.requires_grad, transformer.parameters())
+        optimizer = torch.optim.AdamW(trained_params, lr=lr)
+        return optimizer
+    
+    # AdaMuon is only suitable for hidden layers. Note that in CogVideoX that's 98% of the weights.
+    muon_params = [p for p in transformer.transformer_blocks.parameters() if p.ndim >= 2]
+    muon_params = [p for p in muon_params if p.requires_grad]
+    other_transformer_params = [p for n, p in transformer.named_parameters() if "transformer_blocks" not in n]
+    other_params = [p for p in transformer.transformer_blocks.parameters() if p.ndim < 2]
+    adamw_params = [*other_transformer_params, *other_params]
+
+    muon_params = [p for p in muon_params if p.requires_grad]
+    adamw_params = [p for p in adamw_params if p.requires_grad]
+
+    optimizer = AdaMuon(
+        params=muon_params,
+        lr=1e-3, # Muon LR
+        adamw_params=adamw_params,
+        adamw_lr=lr,
+        use_adjusted_lr=True,
+    )
+
+    return optimizer
+
 class Trainer:
     def __init__(self, config):
         self.config = config
@@ -194,21 +221,24 @@ class Trainer:
                 print(f"Trainable parameter: {name} - {param.shape}")
 
         # Create optimizer out of all trained parameters.
-        trained_params = filter(lambda p: p.requires_grad, self.pipeline.transformer.parameters())
-
         lr = config.get("learning_rate", 1e-4)
-        optimizer = torch.optim.AdamW(trained_params, lr=lr)
+        optimizer = make_optimizer(self.pipeline.transformer, lr, config.get("use_adamuon", False))
 
-        if restore_checkpoint is not None:
+        if restore_checkpoint is not None and not config.get("skip_restore_optimizer", False):
             print("restoring optimizer state")
             optimizer_path = os.path.join(restore_checkpoint, "optimizer.pt")
 
             if os.path.exists(optimizer_path):
                 optimizer_state = torch.load(optimizer_path, map_location=self.accelerator.device)
 
-                # Override LR
                 for optimizer_param in optimizer_state['param_groups']:
-                    optimizer_param['lr'] = lr
+                    if 'adamw_lr' in optimizer_param:
+                        # AdaMuon
+                        optimizer_param['adamw_lr'] = lr
+                        optimizer_param['adamw_lr_ratio'] = lr / optimizer_param['lr']
+                    else:
+                        # AdamW
+                        optimizer_param['lr'] = lr
 
                 optimizer.load_state_dict(optimizer_state)
             else:
@@ -218,7 +248,12 @@ class Trainer:
             self.pipeline.transformer.compile_blocks()
 
         # Prepare model, dataloader, and optimizer for distributed/accelerated training
-        self.pipeline.transformer, self.dataloader, self.optimizer = self.accelerator.prepare(self.pipeline.transformer, self.dataloader, optimizer)
+        self.pipeline.transformer, self.dataloader, self.optimizer = self.accelerator.prepare(
+            self.pipeline.transformer, 
+            self.dataloader, 
+            optimizer,
+        )
+
         self.pipeline.transformer.__dict__["_orig_mod"] = "" # workaround for partial compilation
 
         # Validation dataloader

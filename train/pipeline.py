@@ -709,7 +709,7 @@ class SkyReelsA1V2VInpaintPipeline:
             for t in range(T):
                 frame = pixel_masks[b, 0, t]  # (H, W)
                 nonzero = torch.nonzero(frame)
-                if nonzero.numel() == 0 or nonzero.numel() == frame.numel():
+                if nonzero.numel() == 0:
                     # No mask: top-left (-1, -1), size (0, 0)
                     # or masking full frame (this happens when no face detected)
                     centers.append(torch.tensor([-1, -1], device=frame.device))
@@ -717,8 +717,14 @@ class SkyReelsA1V2VInpaintPipeline:
                 else:
                     y_min, x_min = nonzero.min(dim=0).values
                     y_max, x_max = nonzero.max(dim=0).values
-                    centers.append(torch.stack([(y_max + y_min)//2, (x_max + x_min)//2]))
-                    bbox_sizes.append(torch.stack([y_max - y_min + 1, x_max - x_min + 1]))
+
+                    if y_min == 0 and y_max == H - 1 and x_min == 0 and x_max == W - 1:
+                        # If this is the first frame, we set it to (-1, -1) and (0, 0)
+                        centers.append(torch.tensor([-1, -1], device=frame.device))
+                        bbox_sizes.append(torch.tensor([0, 0], device=frame.device))
+                    else:
+                        centers.append(torch.stack([(y_max + y_min)//2, (x_max + x_min)//2]))
+                        bbox_sizes.append(torch.stack([y_max - y_min + 1, x_max - x_min + 1]))
             # Max bbox size across all frames for this batch item
             bbox_sizes_tensor = torch.stack(bbox_sizes)  # (T, 2)
             max_size = bbox_sizes_tensor.max(dim=0).values  # (2,)

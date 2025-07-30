@@ -765,6 +765,13 @@ class SkyReelsA1V2VInpaintPipeline:
             _, C, T, H, W = pred_decoded.shape
             h = int(bbox_size[0].item())
             w = int(bbox_size[1].item())
+
+            if h < 3 or w < 3:
+                print(f"{h}x{w} bounding box?")
+                # If the bounding box is too small, skip this batch item
+                lpips_losses.append(torch.tensor(0.0, device=pred_decoded.device, dtype=pred_decoded.dtype))
+                continue
+
             pred_canvas = torch.zeros(
                 (T, C, h, w),
                 device=pred_decoded.device,

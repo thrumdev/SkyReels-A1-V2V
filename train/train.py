@@ -151,10 +151,10 @@ def make_optimizer(transformer, lr, use_muon=False):
 
     optimizer = AdaMuon(
         params=muon_params,
-        lr=1e-3, # Muon LR
+        lr=lr,
         adamw_params=adamw_params,
         adamw_lr=lr,
-        use_adjusted_lr=True,
+        use_adjusted_lr=True, # Adjusts parameters' LR based on in/out dim ratio
     )
 
     return optimizer
@@ -234,8 +234,9 @@ class Trainer:
                 for optimizer_param in optimizer_state['param_groups']:
                     if 'adamw_lr' in optimizer_param:
                         # AdaMuon
+                        optimizer_param['lr'] = lr
                         optimizer_param['adamw_lr'] = lr
-                        optimizer_param['adamw_lr_ratio'] = lr / optimizer_param['lr']
+                        optimizer_param['adamw_lr_ratio'] = 1.0 
                     else:
                         # AdamW
                         optimizer_param['lr'] = lr

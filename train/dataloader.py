@@ -101,4 +101,5 @@ def get_dataloader(data_dir, config, mode="train"):
         prefetch_factor=1,
         collate_fn=list_collate,
         shuffle=True if mode == "train" else False,
+        drop_last=True if mode == "train" else False
     )
